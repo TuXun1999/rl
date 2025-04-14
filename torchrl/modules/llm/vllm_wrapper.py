@@ -223,7 +223,7 @@ class vLLMWrapper(CategoricalSequential):
         if from_text:
             self.out_keys += [self.text_response_key, self.token_key]
         if self.return_log_probs:
-            self.out_keys += ["log_probs"]
+            self.out_keys += [self.log_prob_key]
 
     def forward(
         self,
@@ -231,6 +231,15 @@ class vLLMWrapper(CategoricalSequential):
         tensordict_out: TensorDictBase | None = None,
         **kwargs,
     ) -> TensorDictBase:
+        if not tensordict.ndim:
+            # unsqueeze - squeeze the input
+            try:
+                return self(lazy_stack([tensordict]))[0]
+            except Exception as e:
+                raise RuntimeError(
+                    f"Unsqueeze/squeeze failed. Inputs to {type(self).__name__} should ideally be 1 dimensional."
+                ) from e
+
         _source_device = None
         if self._device:
             _source_device = tensordict.device
@@ -303,7 +312,7 @@ class vLLMWrapper(CategoricalSequential):
                 ),
             )
         in_keys = [
-            "log_probs",
+            self.log_prob_key,
             self.token_response_key,
             self.text_response_key,
             self.token_key,
@@ -394,7 +403,7 @@ class vLLMWrapper(CategoricalSequential):
         if isinstance(input_ids_response, list):
             input_ids_response = torch.nested.nested_tensor(input_ids_response)
         out["tokens_response"] = input_ids_response
-        out["log_probs"] = lps
+        out[self.log_prob_key] = lps
         inputs = td.select(*self.in_keys, strict=False)
         if inputs.ndim < out.ndim:
             # This happens when n > 1
@@ -423,18 +432,19 @@ class vLLMWrapper(CategoricalSequential):
             ).to_padded_tensor(padding=self.padding_value)
         tokens_response_td.rename_key_("token_ids", "tokens_response")
         if self.return_log_probs:
-            tokens_response_td.rename_key_("logprobs", "log_probs")
+            tokens_response_td.rename_key_("logprobs", self.log_prob_key)
             if self.pad_output:
                 padded_values = (
                     tokens_response_td["tokens_response"] == self.padding_value
                 )
                 if padded_values.any():
-                    lps = tokens_response_td["log_probs"]
+                    lps = tokens_response_td[self.log_prob_key]
                     lps = torch.where(expand_as_right(~padded_values, lps), lps, 0.0)
-                    tokens_response_td["log_probs"] = lps
+                    tokens_response_td[self.log_prob_key] = lps
         out = tokens_response_td.empty(recurse=True)
         out.update(
-            tokens_response_td, keys_to_update=(self.token_response_key, "log_probs")
+            tokens_response_td,
+            keys_to_update=(self.token_response_key, self.log_prob_key),
         )
         inputs = td.select(*self.in_keys, strict=False)
         if inputs.ndim < out.ndim:
@@ -467,7 +477,7 @@ class vLLMWrapper(CategoricalSequential):
         padded = tokens_response == self.padding_value
         prompt_logprobs = torch.where(~padded, prompt_logprobs, 0.0)
         out = tokens_out._tensordict.empty(recurse=True)
-        out.set("log_probs", prompt_logprobs)
+        out.set(self.log_prob_key, prompt_logprobs)
         out.set(self.token_response_key, tokens_response)
         inputs = td.select(*self.in_keys, strict=False)
         if inputs.ndim < out.ndim:
@@ -501,13 +511,13 @@ class vLLMWrapper(CategoricalSequential):
             )
 
         if self.return_log_probs or "logprobs" in tokens_response_td:
-            tokens_response_td.rename_key_("logprobs", "log_probs")
+            tokens_response_td.rename_key_("logprobs", self.log_prob_key)
             if self.pad_output:
                 padded_values = tokens_response_td["tokens_response"] == padding_value
                 if padded_values.any():
-                    lps = tokens_response_td["log_probs"]
+                    lps = tokens_response_td[self.log_prob_key]
                     lps = torch.where(expand_as_right(~padded_values, lps), lps, 0.0)
-                    tokens_response_td["log_probs"] = lps
+                    tokens_response_td[self.log_prob_key] = lps
         return tokens_response_td
 
     def _to_list(self, tokens, attention_mask):
@@ -566,13 +576,15 @@ class _RequestOutput_tc(TensorClass["nocast"]):
                 t = []
                 for v, tid in zip(output.logprobs, output.token_ids):
                     t.append(
-                        v[tid]["logprob"] if v[tid].get("logprob") is not None else 0.0
+                        v[int(tid)]["logprob"]
+                        if v[tid].get("logprob") is not None
+                        else 0.0
                     )
                 return torch.tensor(t)
 
             if output.logprobs:
                 output.logprobs = get_logprob(output)
-            output.token_ids = torch.tensor(output.token_ids)
+            output.token_ids = torch.as_tensor(output.token_ids)
             return output
 
         if isinstance(self.outputs, list):
@@ -588,14 +600,14 @@ class _RequestOutput_tc(TensorClass["nocast"]):
             if self.prompt_logprobs is not None:
                 self.prompt_logprobs = torch.tensor(
                     [
-                        v[tid].logprob if v is not None else 0.0
+                        v[int(tid)].logprob if v is not None else 0.0
                         for v, tid in _zip_strict(
                             self.prompt_logprobs, self.prompt_token_ids
                         )
                     ]
                 )
-            self.prompt_token_ids = torch.tensor(self.prompt_token_ids)
-            self.num_cached_tokens = torch.tensor(self.num_cached_tokens)
+            self.prompt_token_ids = torch.as_tensor(self.prompt_token_ids)
+            self.num_cached_tokens = torch.as_tensor(self.num_cached_tokens)
 
     @classmethod
     def from_request_output(cls, requests):

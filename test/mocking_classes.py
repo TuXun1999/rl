@@ -1138,14 +1138,17 @@ class CountingEnv(EnvBase):
             dtype=torch.int,
             device=device if self.device is None else self.device,
         )
+        if self.reward_keys:
+            reward_spec = self.full_reward_spec[self.reward_keys[0]]
+            reward_spec_dtype = reward_spec.dtype
+        else:
+            reward_spec_dtype = torch.get_default_dtype()
         tensordict = TensorDict(
             source={
                 "observation": self.count.clone(),
                 "done": self.count > self.max_steps,
                 "terminated": self.count > self.max_steps,
-                "reward": torch.zeros_like(
-                    self.count, dtype=self.full_reward_spec[self.reward_keys[0]].dtype
-                ),
+                "reward": torch.zeros_like(self.count, dtype=reward_spec_dtype),
             },
             batch_size=self.batch_size,
             device=self.device,
@@ -2475,6 +2478,8 @@ class HistoryTransform(Transform):
 
 class DummyStrDataLoader:
     def __init__(self, batch_size=0):
+        if isinstance(batch_size, tuple):
+            batch_size = torch.Size(batch_size).numel()
         self.batch_size = batch_size
 
     def generate_random_string(self, length=10):
@@ -2486,13 +2491,17 @@ class DummyStrDataLoader:
 
     def __next__(self):
         if self.batch_size == 0:
-            return self.generate_random_string()
+            return {"text": self.generate_random_string()}
         else:
-            return [self.generate_random_string() for _ in range(self.batch_size)]
+            return {
+                "text": [self.generate_random_string() for _ in range(self.batch_size)]
+            }
 
 
 class DummyTensorDataLoader:
     def __init__(self, batch_size=0, max_length=10, padding=False):
+        if isinstance(batch_size, tuple):
+            batch_size = torch.Size(batch_size).numel()
         self.batch_size = batch_size
         self.max_length = max_length
         self.padding = padding
@@ -2500,7 +2509,7 @@ class DummyTensorDataLoader:
     def generate_random_tensor(self):
         """Generate a tensor of random int64 values."""
         length = random.randint(1, self.max_length)
-        rt = torch.randint(0, 100, (length,))
+        rt = torch.randint(1, 10000, (length,))
         return rt
 
     def pad_tensor(self, tensor):
@@ -2514,11 +2523,12 @@ class DummyTensorDataLoader:
     def __next__(self):
         if self.batch_size == 0:
             tensor = self.generate_random_tensor()
-            return self.pad_tensor(tensor) if self.padding else tensor
+            tokens = self.pad_tensor(tensor) if self.padding else tensor
         else:
             tensors = [self.generate_random_tensor() for _ in range(self.batch_size)]
             if self.padding:
                 tensors = [self.pad_tensor(tensor) for tensor in tensors]
-                return torch.stack(tensors)
+                tokens = torch.stack(tensors)
             else:
-                return tensors
+                tokens = tensors
+        return {"tokens": tokens, "attention_mask": tokens != 0}

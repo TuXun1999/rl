@@ -23,9 +23,9 @@ from bosdyn.client.robot_command import \
 from bosdyn.client.math_helpers import SE3Pose, Quat
 from bosdyn.client import frame_helpers
 from bosdyn.client.frame_helpers import (BODY_FRAME_NAME, 
-                                         ODOM_FRAME_NAME, 
+                                         VISION_FRAME_NAME, 
                                          HAND_FRAME_NAME,
-                                         VISION_FRAME_NAME,
+                                         ODOM_FRAME_NAME,
                                          GRAV_ALIGNED_BODY_FRAME_NAME,
                                          get_se2_a_tform_b,
                                          get_vision_tform_body,
@@ -176,7 +176,7 @@ class SPOT:
         print('Image sources:')
         for source in image_sources:
             print('\t' + source.name)
-    def get_base_pose_se2(self, frame_name = ODOM_FRAME_NAME):
+    def get_base_pose_se2(self, frame_name = VISION_FRAME_NAME):
         # The function to get the robot's base pose in SE2
         robot_state = self.state_client.get_robot_state()
         odom_T_base = frame_helpers.get_a_tform_b(\
@@ -192,7 +192,7 @@ class SPOT:
                             end_time_secs=time.time() + exec_time)
         # Wait until the robot reports that it is at the goal.
         block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=4)
-    def send_pose_command_se2(self, x, y, theta, exec_time = 1.5, frame_name = ODOM_FRAME_NAME):
+    def send_pose_command_se2(self, x, y, theta, exec_time = 1.5, frame_name = VISION_FRAME_NAME):
         # The function to send the pose command to move the robot to the desired pose
         move_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
             goal_x=x, goal_y=y, goal_heading=theta, \
@@ -375,7 +375,7 @@ class SPOT:
         body_T_target = SE3Pose.from_matrix(body_T_target)
         odom_T_body = frame_helpers.get_a_tform_b(\
                     robot_state.kinematic_state.transforms_snapshot,
-                    frame_helpers.ODOM_FRAME_NAME, \
+                    frame_helpers.VISION_FRAME_NAME, \
                     frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
         odom_T_target = odom_T_body * body_T_target
         # Send the command to move the robot base
@@ -384,7 +384,7 @@ class SPOT:
         gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(1)
         move_command = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
             odom_T_target_se2.x, odom_T_target_se2.y, odom_T_target_se2.angle, \
-                frame_name=ODOM_FRAME_NAME, \
+                frame_name=VISION_FRAME_NAME, \
                 params=self.get_walking_params(0.6, 1),\
                 build_on_command=gripper_command)
         id = self.command_client.robot_command(command=move_command, \

@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation as R
 from tkinter import *
 import os 
 
-import gym
+
 
 import bosdyn.client
 import bosdyn.client.util

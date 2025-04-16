@@ -2,14 +2,14 @@
 env:
   name: SE2
   task: ""
-  library: "spot"
+  library: "se2"
   max_episode_steps: 40
   seed: 42
 
 # collector
 collector:
-  total_frames: 1_800
-  prior_frames: 2_500 #1_0000
+  total_frames: 1_0000
+  prior_frames: 1_0000
   init_random_frames: 50
   frames_per_batch: 25
   init_env_steps: 100

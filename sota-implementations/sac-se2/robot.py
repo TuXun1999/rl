@@ -399,7 +399,12 @@ class SPOT:
 
         # NOTE: Unsure if this method still suffers from the motion drift issue
         # An alternative way is to use recording_tform_body
-        odom_tform_body = get_odom_tform_body(state.robot_kinematics.transforms_snapshot)
+        # odom_tform_body = get_odom_tform_body(state.robot_kinematics.transforms_snapshot)
+
+        waypoint_tform_body = state.localization.waypoint_tform_body
+        waypoint_id = state.localization.waypoint_id
+        waypoint = self._get_waypoint(waypoint_id)
+        odom_tform_body = (SE3Pose.from_proto(waypoint.waypoint_tform_ko).inverse()).mult(waypoint_tform_body)
         return odom_tform_body.get_closest_se2_transform()
     def get_base_pose_se2(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True,\
                         graphnav = False):

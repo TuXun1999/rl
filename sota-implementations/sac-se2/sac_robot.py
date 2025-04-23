@@ -78,9 +78,15 @@ def main(cfg: DictConfig):  # noqa: F821
     robot = SPOT(cfg)
     robot.lease_alive()
     robot.power_on_stand()
+    if cfg.new_graph:
+        robot.create_graph()
+    else:
+        robot._upload_graph_and_snapshots()
     # Record the initial se2 pose of robot
     robot_start_pose = robot.get_base_pose_se2()
     # Create environments
+    print("One simple test")
+    print(robot._current_graph is not None)
     train_env, eval_env = make_environment(cfg, logger=logger, robot=robot)
 
 

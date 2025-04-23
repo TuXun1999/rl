@@ -15,6 +15,7 @@ import bosdyn.client
 import bosdyn.client.util
 from bosdyn.api import image_pb2
 from bosdyn.api import gripper_camera_param_pb2
+from google.protobuf import wrappers_pb2 as wrappers
 from bosdyn.client.image import ImageClient, build_image_request
 from bosdyn.client.gripper_camera_param import GripperCameraParamClient
 from bosdyn.client.robot_command import \
@@ -29,12 +30,14 @@ from bosdyn.client.frame_helpers import (BODY_FRAME_NAME,
                                          GRAV_ALIGNED_BODY_FRAME_NAME,
                                          get_se2_a_tform_b,
                                          get_vision_tform_body,
-                                         get_a_tform_b)
+                                         get_a_tform_b,
+                                         get_odom_tform_body)
 
 import bosdyn.api.power_pb2 as PowerServiceProto
 import bosdyn.api.robot_state_pb2 as robot_state_proto
 import bosdyn.client.util
-from bosdyn.api import arm_command_pb2, geometry_pb2, robot_command_pb2, synchronized_command_pb2
+from bosdyn.api import arm_command_pb2, geometry_pb2, robot_command_pb2, \
+    world_object_pb2, synchronized_command_pb2
 from bosdyn.client import ResponseError, RpcError, create_standard_sdk
 from bosdyn.client.async_tasks import AsyncPeriodicQuery
 from bosdyn.client.estop import EstopClient, EstopEndpoint, EstopKeepAlive
@@ -44,8 +47,14 @@ from bosdyn.client.power import PowerClient
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient
 from bosdyn.client.robot_state import RobotStateClient
 from bosdyn.client.time_sync import TimeSyncError
-
+from bosdyn.client.world_object import WorldObjectClient
 from bosdyn.util import duration_str, format_metric, secs_to_hms
+from bosdyn.api.graph_nav import map_pb2, map_processing_pb2, recording_pb2
+from bosdyn.client import ResponseError, RpcError, create_standard_sdk
+from bosdyn.client.graph_nav import GraphNavClient
+from bosdyn.client.map_processing import MapProcessingServiceClient
+from bosdyn.client.recording import GraphNavRecordingServiceClient
+import graph_nav_util
 
 ## RL environments
 from torchrl.data import Bounded, Composite, Unbounded
@@ -130,10 +139,56 @@ class SPOT:
         else:
             self.image_client = self.robot.ensure_client(ImageClient.default_service_name)
 
+        # Clients
         self.state_client = self.robot.ensure_client(RobotStateClient.default_service_name)
         self.lease_client = self.robot.ensure_client(bosdyn.client.lease.LeaseClient.default_service_name)
         
         self.command_client = self.robot.ensure_client(RobotCommandClient.default_service_name)
+        self.world_object_client = self.robot.ensure_client(WorldObjectClient.default_service_name)
+        
+        # Clients for GraphNav service
+        # Filepath for the location to put the downloaded graph and snapshots.
+        self._download_filepath = options.graph_path
+        self._upload_filepath = self._download_filepath
+
+        # Crate metadata for the recording session.
+        if hasattr(options, "session_name"):
+            session_name = options.session_name
+        else:
+            session_name = "test"
+        user_name = self.robot._current_user
+        client_metadata = GraphNavRecordingServiceClient.make_client_metadata(
+            session_name=session_name, client_username=user_name, client_id='RecordingClient',
+            client_type='Python SDK')
+        # Setup the recording service client.
+        self._recording_client = self.robot.ensure_client(
+            GraphNavRecordingServiceClient.default_service_name)
+
+        # Create the recording environment.
+        self._recording_environment = GraphNavRecordingServiceClient.make_recording_environment(
+            waypoint_env=GraphNavRecordingServiceClient.make_waypoint_environment(
+                client_metadata=client_metadata))
+
+        # Setup the graph nav service client.
+        self._graph_nav_client = self.robot.ensure_client(GraphNavClient.default_service_name)
+
+        self._map_processing_client = self.robot.ensure_client(
+            MapProcessingServiceClient.default_service_name)
+
+        # Store the most recent knowledge of the state of the robot based on rpc calls.
+        self._current_graph = None
+        self._current_edges = dict()  #maps to_waypoint to list(from_waypoint)
+        self._current_waypoint_snapshots = dict()  # maps id to waypoint snapshot
+        self._current_edge_snapshots = dict()  # maps id to edge snapshot
+        self._current_annotation_name_to_wp_id = dict()
+        
+        
+        # Estimated fid poses in robot's body frame
+        self.fid = False
+        self.fid_poses = None
+        self.fid_frame = None
+        self._max_attempts = 1000
+        
         # Verification before the formal task
         assert self.robot.has_arm(), 'Robot requires an arm to run this example.'
         # Verify the robot is not estopped and that an external application has registered and holds
@@ -176,33 +231,6 @@ class SPOT:
         print('Image sources:')
         for source in image_sources:
             print('\t' + source.name)
-    def get_base_pose_se2(self, frame_name = VISION_FRAME_NAME):
-        # The function to get the robot's base pose in SE2
-        robot_state = self.state_client.get_robot_state()
-        odom_T_base = frame_helpers.get_a_tform_b(\
-            robot_state.kinematic_state.transforms_snapshot, frame_name, GRAV_ALIGNED_BODY_FRAME_NAME)
-        return odom_T_base.get_closest_se2_transform()
-    
-    def send_velocit_command_se2(self, vx, vy, vtheta, exec_time = 1.5):
-        # The function to send the se2 synchro velocity command to the robot
-        move_cmd = RobotCommandBuilder.synchro_velocity_command(\
-            v_x=vx, v_y=vy, v_rot=vtheta)
-
-        cmd_id = self.command_client.robot_command(command=move_cmd,
-                            end_time_secs=time.time() + exec_time)
-        # Wait until the robot reports that it is at the goal.
-        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=4)
-    def send_pose_command_se2(self, x, y, theta, exec_time = 1.5, frame_name = VISION_FRAME_NAME):
-        # The function to send the pose command to move the robot to the desired pose
-        move_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
-            goal_x=x, goal_y=y, goal_heading=theta, \
-                frame_name=frame_name, \
-                params=self.get_walking_params(0.6, 1)
-            )
-        cmd_id = self.command_client.robot_command(command=move_cmd,\
-                                end_time_secs = time.time() + exec_time)
-        # Wait until the robot reports that it is at the goal.
-        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=2.0)
     def capture_images(self, options):
         # Capture and save images to disk
         pixel_format = pixel_format_string_to_enum(options.pixel_format)
@@ -254,148 +282,525 @@ class SPOT:
         #     '/', '')  # Remove any slashes from the filename the image is saved at locally.
         # cv2.imwrite(image_saved_path + custom_tag + extension, img)
         return image_responses, images, image_extensions
+    '''
+    Find & Execute the SE2 pose of the base of the robot
+    '''
+    # Find fiducial objects using world_object service
+    def get_fiducial_objects(self):
+        """Get all fiducials that Spot detects with its perception system."""
+        # Get all fiducial objects (an object of a specific type).
+        request_fiducials = [world_object_pb2.WORLD_OBJECT_APRILTAG]
+        fiducial_objects = self.world_object_client.list_world_objects(
+            object_type=request_fiducials).world_objects
+        if len(fiducial_objects):
+            # Return all the detected fiducials.
+            return fiducial_objects
+        # Return none if no fiducials are found.
+        return None
     
-    def estimate_obj_distance(self, image_depth_response, bbox):
-        ## Estimate the distance to the target object by estimating the depth image
-        # Depth is a raw bytestream
-        cv_depth = np.frombuffer(image_depth_response.shot.image.data, dtype=np.uint16)
-        cv_depth = cv_depth.reshape(image_depth_response.shot.image.rows,
-                                    image_depth_response.shot.image.cols)
-        
-        # Visualize the depth image
-        # cv2.applyColorMap() only supports 8-bit; 
-        # convert from 16-bit to 8-bit and do scaling
-        min_val = np.min(cv_depth)
-        max_val = np.max(cv_depth)
-        depth_range = max_val - min_val
-        depth8 = (255.0 / depth_range * (cv_depth - min_val)).astype('uint8')
-        depth8_rgb = cv2.cvtColor(depth8, cv2.COLOR_GRAY2RGB)
-        depth_color = cv2.applyColorMap(depth8_rgb, cv2.COLORMAP_JET)
+    def read_fid(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True):
+        attempts = 0
+        self.fid_frame = frame_name
+        while attempts <= self._max_attempts:
+            self.fid = False
+            self.fid_ids = []
+            if use_world_object_service:
+                # Get the fiducial object Spot detects with the world object service.
+                fiducials = self.get_fiducial_objects()
+                if fiducials is not None:
+                    self.fid_poses = []
+                    for fiducial in fiducials:
+                        vision_tform_fiducial = get_a_tform_b(
+                            fiducial.transforms_snapshot, frame_name,
+                            fiducial.apriltag_properties.frame_name_fiducial)
+                        self.fid_poses.append(vision_tform_fiducial)
+                        self.fid_ids.append(fiducial.apriltag_properties.tag_id)     
+            else:
+                print("Not supported yet")
+                assert False
 
-
-        # Save the image locally
-        filename = os.path.join("images", "initial_search_depth.png")
-        cv2.imwrite(filename, depth_color)
-        # Convert the value into real-world distance & Find the average value within bbox
-        dist_avg = 0
-        dist_count = 0
-        dist_scale = image_depth_response.source.depth_scale
-
-        for i in range(int(bbox[1]), int(bbox[3])):
-            for j in range((int(bbox[0])), int(bbox[2])):
-                if cv_depth[i, j] != 0:
-                    dist_avg += cv_depth[i, j] / dist_scale
-                    dist_count += 1
-        
-        distance = dist_avg / dist_count
-        return distance
-
-    def estimate_obj_pose_hand(self, bbox, image_response, distance):
-        ## Estimate the target object pose (indicated by the bounding box) in hand frame
-        bbox_center = [int((bbox[1] + bbox[3])/2), int((bbox[0] + bbox[2])/2)]
-        pick_x, pick_y = bbox_center
-        # Obtain the camera inforamtion
-        camera_info = image_response.source
-        
-        w = camera_info.cols
-        h = camera_info.rows
-        fl_x = camera_info.pinhole.intrinsics.focal_length.x
-        k1= camera_info.pinhole.intrinsics.skew.x
-        cx = camera_info.pinhole.intrinsics.principal_point.x
-        fl_y = camera_info.pinhole.intrinsics.focal_length.y
-        k2 = camera_info.pinhole.intrinsics.skew.y
-        cy = camera_info.pinhole.intrinsics.principal_point.y
-
-        pinhole_camera_proj = np.array([
-            [fl_x, 0, cx, 0],
-            [0, fl_y, cy, 0],
-            [0, 0, 1, 0]
-        ])
-        pinhole_camera_proj = np.float32(pinhole_camera_proj) # Converted into float type
-
-        # Calculate the object's pose in hand camera frame
-        initial_guess = [1, 1, 10]
-        def equations(vars):
-            x, y, z = vars
-            eq = [
-                pinhole_camera_proj[0][0] * x + pinhole_camera_proj[0][1] * y + pinhole_camera_proj[0][2] * z - pick_x * z,
-                pinhole_camera_proj[1][0] * x + pinhole_camera_proj[1][1] * y + pinhole_camera_proj[1][2] * z - pick_y * z,
-                x * x + y * y + z * z - distance * distance
-            ]
-            return eq
-
-        root = fsolve(equations, initial_guess)
-        # Correct the frame conventions in hand frame & pinhole model
-        # pinhole model: z-> towards object, x-> rightward, y-> downward
-        # hand frame in SPOT: x-> towards object, y->rightward
-        result = SE3Pose(x=root[2], y=-root[0], z=-root[1], rot=Quat(w=1, x=0, y=0, z=0))
-        return result
-    def correct_body(self, obj_pose_hand):
-        # Find the object pose in body frame
-        robot_state = self.state_client.get_robot_state()
-        body_T_hand = frame_helpers.get_a_tform_b(\
-                    robot_state.kinematic_state.transforms_snapshot,
-                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, \
-                    frame_helpers.HAND_FRAME_NAME)
-        body_T_obj = body_T_hand * obj_pose_hand
-
-        # Rotate the body 
-        body_T_obj_se2 = body_T_obj.get_closest_se2_transform()
-
-        # Command the robot to rotate its body
-        move_command = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(\
-            0, 0, body_T_obj_se2.angle, \
-                robot_state.kinematic_state.transforms_snapshot, \
-                params=self.get_walking_params(0.6, 1))
-        id = self.command_client.robot_command(command=move_command, \
-                                               end_time_secs=time.time() + 10)
-        block_for_trajectory_cmd(self.command_client,
-                                    cmd_id=id, 
-                                    feedback_interval_secs=5, 
-                                    timeout_sec=10,
-                                    logger=None)
-
-
-
-    def move_base_arc(self, obj_pose_hand:SE3Pose, angle):
-        # Find the object pose in body frame
-        robot_state = self.state_client.get_robot_state()
-        body_T_hand = frame_helpers.get_a_tform_b(\
-                    robot_state.kinematic_state.transforms_snapshot,
-                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, \
-                    frame_helpers.HAND_FRAME_NAME)
-        body_T_obj = body_T_hand * obj_pose_hand
-
-        # Rotate the robot base w.r.t the object pose
-        body_T_obj_mat = body_T_obj.to_matrix()
-        rot_mat = R.from_rotvec([0, 0, angle]).as_matrix()
-        rot = np.eye(4)
-        rot[0:3, 0:3] = rot_mat
-        body_T_target = body_T_obj_mat @ rot @ np.linalg.inv(body_T_obj_mat)
-        body_T_target = SE3Pose.from_matrix(body_T_target)
-        odom_T_body = frame_helpers.get_a_tform_b(\
-                    robot_state.kinematic_state.transforms_snapshot,
-                    frame_helpers.VISION_FRAME_NAME, \
+            
+            if len(self.fid_poses) != 0:
+                self.fid = True
+                break
+        self.fid_initial_vision_tform_body = get_a_tform_b(\
+                    self.state_client.get_robot_state().kinematic_state.transforms_snapshot,
+                    frame_helpers.ODOM_FRAME_NAME, \
                     frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
-        odom_T_target = odom_T_body * body_T_target
-        # Send the command to move the robot base
-        odom_T_target_se2 = odom_T_target.get_closest_se2_transform()
-        # Command the robot to open its gripper
-        gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(1)
-        move_command = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
-            odom_T_target_se2.x, odom_T_target_se2.y, odom_T_target_se2.angle, \
-                frame_name=VISION_FRAME_NAME, \
-                params=self.get_walking_params(0.6, 1),\
-                build_on_command=gripper_command)
-        id = self.command_client.robot_command(command=move_command, \
-                                               end_time_secs=time.time() + 10)
-        block_for_trajectory_cmd(self.command_client,
-                                    cmd_id=id, 
-                                    feedback_interval_secs=5, 
-                                    timeout_sec=10,
-                                    logger=None)
-        print("Moving done")
+        return self.fid
+    
+    def get_base_pose_se2_fid(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True):
+        attempts = 0
+        # Only support recovering the frame where fids are defined
+        assert frame_name == self.fid_frame
+        while attempts <= self._max_attempts:
+            if use_world_object_service:
+                # Get the fiducial object Spot detects with the world object service.
+                fiducials = self.get_fiducial_objects()
+                vision_body_guesses = []
+                if fiducials is not None:
+                    for fiducial in fiducials:
+                        fiducial_tform_body = get_a_tform_b(
+                            fiducial.transforms_snapshot, \
+                            fiducial.apriltag_properties.frame_name_fiducial,\
+                            BODY_FRAME_NAME)
+                        fid_id = fiducial.apriltag_properties.tag_id
+                        vision_tform_fid = self.fid_poses[self.fid_ids.index(fid_id)]
+                        vision_tform_body = vision_tform_fid.mult(fiducial_tform_body)
+                        body_tform_gpe = get_a_tform_b(\
+                            self.state_client.get_robot_state().kinematic_state.transforms_snapshot,
+                            frame_helpers.BODY_FRAME_NAME, \
+                            frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
+                        vision_tform_gpe = vision_tform_body.mult(body_tform_gpe)
+                        vision_body_guesses.append(vision_tform_gpe)
+                    break
+                else:
+                    print("Unable to find any fid. Use non-visual method")
+                     # The function to get the robot's base pose in SE2
+                    robot_state = self.state_client.get_robot_state()
+                    odom_T_base = frame_helpers.get_a_tform_b(\
+                        robot_state.kinematic_state.transforms_snapshot, frame_name, GRAV_ALIGNED_BODY_FRAME_NAME)
+                    return odom_T_base.get_closest_se2_transform()
+            else:
+                print("Not supported yet")
+                assert False
+        def average_SE3_poses(se3poses):
+            x = 0
+            y = 0
+            z = 0
+            rx = 0
+            ry = 0
+            rz = 0
+            rw = 0
+            for se3pose in se3poses:
+                x += se3pose.position.x
+                y += se3pose.position.y
+                z += se3pose.position.z
+                rx += se3pose.rotation.x
+                ry += se3pose.rotation.y
+                rz += se3pose.rotation.z
+                rw += se3pose.rotation.w 
+            x /= len(se3poses)
+            y /= len(se3poses)
+            z /= len(se3poses)
+            ry /= len(se3poses)
+            rx /= len(se3poses)
+            rz /= len(se3poses)
+            rw /= len(se3poses)
+            
+            final_pose = SE3Pose(x=x, y=y, z=z, rot=Quat(w=rw, x=rx, y=ry, z=rz))
+            return final_pose
+        print(vision_body_guesses[0])
+        return average_SE3_poses(vision_body_guesses).get_closest_se2_transform()
+    
+    def get_base_pose_se2_graphnav(self, frame_name = ODOM_FRAME_NAME):
+        # The function to get the robot's base pose in SE2 using waypoints in GraphNav
+        state = self._graph_nav_client.get_localization_state()
 
+        # NOTE: Unsure if this method still suffers from the motion drift issue
+        # An alternative way is to use recording_tform_body
+        odom_tform_body = get_odom_tform_body(state.robot_kinematics.transforms_snapshot)
+        return odom_tform_body.get_closest_se2_transform()
+    def get_base_pose_se2(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True,\
+                        graphnav = False):
+        if graphnav is False:
+            # The function to get the robot's base pose in SE2
+            robot_state = self.state_client.get_robot_state()
+            odom_T_base = frame_helpers.get_a_tform_b(\
+                robot_state.kinematic_state.transforms_snapshot, frame_name, GRAV_ALIGNED_BODY_FRAME_NAME)
+            return odom_T_base.get_closest_se2_transform()
+        else:
+            return self.get_base_pose_se2_graphnav()
+    
+    def send_velocit_command_se2(self, vx, vy, vtheta, exec_time = 1.5):
+        # The function to send the se2 synchro velocity command to the robot
+        move_cmd = RobotCommandBuilder.synchro_velocity_command(\
+            v_x=vx, v_y=vy, v_rot=vtheta)
+
+        cmd_id = self.command_client.robot_command(command=move_cmd,
+                            end_time_secs=time.time() + exec_time)
+        # Wait until the robot reports that it is at the goal.
+        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=4)
+    def send_pose_command_se2(self, x, y, theta, exec_time = 1.5, frame_name = ODOM_FRAME_NAME):
+        # The function to send the pose command to move the robot to the desired pose
+        move_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
+            goal_x=x, goal_y=y, goal_heading=theta, \
+                frame_name=frame_name, \
+                params=self.get_walking_params(0.6, 1)
+            )
+        cmd_id = self.command_client.robot_command(command=move_cmd,\
+                                end_time_secs = time.time() + exec_time)
+        # Wait until the robot reports that it is at the goal.
+        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=2.0)
+
+    '''
+    GraphNav services
+    '''
+    def create_graph(self, radius = 1.0, waypoint_num = 20):
+        '''
+        Function to create a new graph on the robot.
+        '''
+        # Record the starting state of the robot.
+        self.odom_tform_recording = get_odom_tform_body(self.state_client.get_robot_state().kinematic_state.transforms_snapshot)
+        # Clear the map on the robot.
+        self._clear_map()
+        # Start recording a new map.
+        self._start_recording()
+
+        # Create waypoints by a random walk
+        for i in range(waypoint_num):
+            # Create a new waypoint at the robot's current location.
+            self._create_default_waypoint()
+            # Move the robot to a random location.
+            x = np.random.uniform(-radius, radius)
+            y = np.random.uniform(-radius, radius)
+            theta = np.random.uniform(0, 2 * np.pi)
+            self.send_pose_command_se2(x, y, theta, exec_time=1.5)
+
+            # Create a waypoint at the robot's location
+            self._record_waypoint("waypoint_{}".format(i))
+        
+        # Stop recording the map & Download the graph
+        self._stop_recording()
+        self._download_full_graph()
+        print("Graph is downloaded !")
+        
+    def _should_we_start_recording(self):
+        # Before starting to record, check the state of the GraphNav system.
+        graph = self._graph_nav_client.download_graph()
+        if graph is not None:
+            # Check that the graph has waypoints. If it does, then we need to be localized to the graph
+            # before starting to record
+            if len(graph.waypoints) > 0:
+                localization_state = self._graph_nav_client.get_localization_state()
+                if not localization_state.localization.waypoint_id:
+                    # Not localized to anything in the map. The best option is to clear the graph or
+                    # attempt to localize to the current map.
+                    # Returning false since the GraphNav system is not in the state it should be to
+                    # begin recording.
+                    return False
+        # If there is no graph or there exists a graph that we are localized to, then it is fine to
+        # start recording, so we return True.
+        return True
+
+    def _clear_map(self):
+        """Clear the state of the map on the robot, removing all waypoints and edges."""
+        return self._graph_nav_client.clear_graph()
+
+    def _start_recording(self):
+        """Start recording a map."""
+        should_start_recording = self._should_we_start_recording()
+        if not should_start_recording:
+            print("The system is not in the proper state to start recording.", \
+                   "Try using the graph_nav_command_line to either clear the map or", \
+                   "attempt to localize to the map.")
+            return
+        try:
+            status = self._recording_client.start_recording(
+                recording_environment=self._recording_environment)
+            print("Successfully started recording a map.")
+        except Exception as err:
+            print("Start recording failed: " + str(err))
+
+    def _stop_recording(self):
+        """Stop or pause recording a map."""
+        first_iter = True
+        while True:
+            try:
+                status = self._recording_client.stop_recording()
+                print("Successfully stopped recording a map.")
+                break
+            except bosdyn.client.recording.NotReadyYetError as err:
+                # It is possible that we are not finished recording yet due to
+                # background processing. Try again every 1 second.
+                if first_iter:
+                    print("Cleaning up recording...")
+                first_iter = False
+                time.sleep(1.0)
+                continue
+            except Exception as err:
+                print("Stop recording failed: " + str(err))
+                break
+
+    def _get_recording_status(self, *args):
+        """Get the recording service's status."""
+        status = self._recording_client.get_record_status()
+        if status.is_recording:
+            print("The recording service is on.")
+        else:
+            print("The recording service is off.")
+
+    def _create_default_waypoint(self, *args):
+        """Create a default waypoint at the robot's current location."""
+        resp = self._recording_client.create_waypoint(waypoint_name="default")
+        if resp.status == recording_pb2.CreateWaypointResponse.STATUS_OK:
+            print("Successfully created a waypoint.")
+        else:
+            print("Could not create a waypoint.")
+
+    def _download_full_graph(self):
+        """Download the graph and snapshots from the robot."""
+        graph = self._graph_nav_client.download_graph()
+        self._current_graph = graph
+        if graph is None:
+            print("Failed to download the graph.")
+            return
+        self._write_full_graph(graph)
+        print("Graph downloaded with {} waypoints and {} edges".format(
+            len(graph.waypoints), len(graph.edges)))
+        # Download the waypoint and edge snapshots.
+        self._download_and_write_waypoint_snapshots(graph.waypoints)
+        self._download_and_write_edge_snapshots(graph.edges)
+    def _upload_graph_and_snapshots(self, *args):
+        """Upload the graph and snapshots to the robot."""
+        print('Loading the graph from disk into local storage...')
+        with open(self._upload_filepath + '/graph', 'rb') as graph_file:
+            # Load the graph from disk.
+            data = graph_file.read()
+            self._current_graph = map_pb2.Graph()
+            self._current_graph.ParseFromString(data)
+            print(
+                f'Loaded graph has {len(self._current_graph.waypoints)} waypoints and {self._current_graph.edges} edges'
+            )
+        for waypoint in self._current_graph.waypoints:
+            # Load the waypoint snapshots from disk.
+            with open(f'{self._upload_filepath}/waypoint_snapshots/{waypoint.snapshot_id}',
+                      'rb') as snapshot_file:
+                waypoint_snapshot = map_pb2.WaypointSnapshot()
+                waypoint_snapshot.ParseFromString(snapshot_file.read())
+                self._current_waypoint_snapshots[waypoint_snapshot.id] = waypoint_snapshot
+        for edge in self._current_graph.edges:
+            if len(edge.snapshot_id) == 0:
+                continue
+            # Load the edge snapshots from disk.
+            with open(f'{self._upload_filepath}/edge_snapshots/{edge.snapshot_id}',
+                      'rb') as snapshot_file:
+                edge_snapshot = map_pb2.EdgeSnapshot()
+                edge_snapshot.ParseFromString(snapshot_file.read())
+                self._current_edge_snapshots[edge_snapshot.id] = edge_snapshot
+        # Upload the graph to the robot.
+        print('Uploading the graph and snapshots to the robot...')
+        true_if_empty = not len(self._current_graph.anchoring.anchors)
+        response = self._graph_nav_client.upload_graph(graph=self._current_graph,
+                                                       generate_new_anchoring=true_if_empty)
+        # Upload the snapshots to the robot.
+        for snapshot_id in response.unknown_waypoint_snapshot_ids:
+            waypoint_snapshot = self._current_waypoint_snapshots[snapshot_id]
+            self._graph_nav_client.upload_waypoint_snapshot(waypoint_snapshot)
+            print(f'Uploaded {waypoint_snapshot.id}')
+        for snapshot_id in response.unknown_edge_snapshot_ids:
+            edge_snapshot = self._current_edge_snapshots[snapshot_id]
+            self._graph_nav_client.upload_edge_snapshot(edge_snapshot)
+            print(f'Uploaded {edge_snapshot.id}')
+
+        # The upload is complete! Check that the robot is localized to the graph,
+        # and if it is not, prompt the user to localize the robot before attempting
+        # any navigation commands.
+        localization_state = self._graph_nav_client.get_localization_state()
+        if not localization_state.localization.waypoint_id:
+            # The robot is not localized to the newly uploaded graph.
+            print('\n')
+            print(
+                'Upload complete! The robot is currently not localized to the map; please localize'
+                ' the robot using commands (2) or (3) before attempting a navigation command.')
+    def _write_full_graph(self, graph):
+        """Download the graph from robot to the specified, local filepath location."""
+        graph_bytes = graph.SerializeToString()
+        self._write_bytes(self._download_filepath, '/graph', graph_bytes)
+
+    def _download_and_write_waypoint_snapshots(self, waypoints):
+        """Download the waypoint snapshots from robot to the specified, local filepath location."""
+        num_waypoint_snapshots_downloaded = 0
+        for waypoint in waypoints:
+            if len(waypoint.snapshot_id) == 0:
+                continue
+            try:
+                waypoint_snapshot = self._graph_nav_client.download_waypoint_snapshot(
+                    waypoint.snapshot_id)
+            except Exception:
+                # Failure in downloading waypoint snapshot. Continue to next snapshot.
+                print("Failed to download waypoint snapshot: " + waypoint.snapshot_id)
+                continue
+            self._write_bytes(self._download_filepath + '/waypoint_snapshots',
+                              '/' + waypoint.snapshot_id, waypoint_snapshot.SerializeToString())
+            num_waypoint_snapshots_downloaded += 1
+            print("Downloaded {} of the total {} waypoint snapshots.".format(
+                num_waypoint_snapshots_downloaded, len(waypoints)))
+
+    def _download_and_write_edge_snapshots(self, edges):
+        """Download the edge snapshots from robot to the specified, local filepath location."""
+        num_edge_snapshots_downloaded = 0
+        num_to_download = 0
+        for edge in edges:
+            if len(edge.snapshot_id) == 0:
+                continue
+            num_to_download += 1
+            try:
+                edge_snapshot = self._graph_nav_client.download_edge_snapshot(edge.snapshot_id)
+            except Exception:
+                # Failure in downloading edge snapshot. Continue to next snapshot.
+                print("Failed to download edge snapshot: " + edge.snapshot_id)
+                continue
+            self._write_bytes(self._download_filepath + '/edge_snapshots', '/' + edge.snapshot_id,
+                              edge_snapshot.SerializeToString())
+            num_edge_snapshots_downloaded += 1
+            print("Downloaded {} of the total {} edge snapshots.".format(
+                num_edge_snapshots_downloaded, num_to_download))
+
+    def _write_bytes(self, filepath, filename, data):
+        """Write data to a file."""
+        os.makedirs(filepath, exist_ok=True)
+        with open(filepath + filename, 'wb+') as f:
+            f.write(data)
+            f.close()
+
+    def _update_graph_waypoint_and_edge_ids(self, do_print=False):
+        # Download current graph
+        graph = self._graph_nav_client.download_graph()
+        if graph is None:
+            print("Empty graph.")
+            return
+        self._current_graph = graph
+
+        localization_id = self._graph_nav_client.get_localization_state().localization.waypoint_id
+
+        # Update and print waypoints and edges
+        self._current_annotation_name_to_wp_id, self._current_edges = graph_nav_util.update_waypoints_and_edges(
+            graph, localization_id, do_print)
+
+    def _list_graph_waypoint_and_edge_ids(self, *args):
+        """List the waypoint ids and edge ids of the graph currently on the robot."""
+        self._update_graph_waypoint_and_edge_ids(do_print=True)
+
+    def _create_new_edge(self, waypoint1, waypoint2):
+        """Create new edge between existing waypoints in map."""
+
+        self._update_graph_waypoint_and_edge_ids(do_print=False)
+
+        from_id = graph_nav_util.find_unique_waypoint_id(waypoint1, self._current_graph,
+                                                         self._current_annotation_name_to_wp_id)
+        to_id = graph_nav_util.find_unique_waypoint_id(waypoint2, self._current_graph,
+                                                       self._current_annotation_name_to_wp_id)
+
+        print("Creating edge from {} to {}.".format(from_id, to_id))
+
+        from_wp = self._get_waypoint(from_id)
+        if from_wp is None:
+            return
+
+        to_wp = self._get_waypoint(to_id)
+        if to_wp is None:
+            return
+
+        # Get edge transform based on kinematic odometry
+        edge_transform = self._get_transform(from_wp, to_wp)
+
+        # Define new edge
+        new_edge = map_pb2.Edge()
+        new_edge.id.from_waypoint = from_id
+        new_edge.id.to_waypoint = to_id
+        new_edge.from_tform_to.CopyFrom(edge_transform)
+
+        # print("edge transform =", new_edge.from_tform_to)
+
+        # Send request to add edge to map
+        try:
+            self._recording_client.create_edge(edge=new_edge)
+        except Exception as e:
+            print(e)
+
+    def _create_loop(self, *args):
+        """Create edge from last waypoint to first waypoint."""
+
+        self._update_graph_waypoint_and_edge_ids(do_print=False)
+
+        if len(self._current_graph.waypoints) < 2:
+            print(
+                "Graph contains {} waypoints -- at least two are needed to create loop.".format(
+                    len(self._current_graph.waypoints)))
+            return False
+
+        sorted_waypoints = graph_nav_util.sort_waypoints_chrono(self._current_graph)
+        edge_waypoints = [sorted_waypoints[-1][0], sorted_waypoints[0][0]]
+
+        self._create_new_edge(edge_waypoints)
+
+    def _auto_close_loops_prompt(self, *args):
+        print("""
+        Options:
+        (0) Close all loops.
+        (1) Close only fiducial-based loops.
+        (2) Close only odometry-based loops.
+        (q) Back.
+        """)
+        try:
+            inputs = input('>')
+        except NameError:
+            return
+        req_type = str.split(inputs)[0]
+        close_fiducial_loops = False
+        close_odometry_loops = False
+        if req_type == '0':
+            close_fiducial_loops = True
+            close_odometry_loops = True
+        elif req_type == '1':
+            close_fiducial_loops = True
+        elif req_type == '2':
+            close_odometry_loops = True
+        elif req_type == 'q':
+            return
+        else:
+            print("Unrecognized command. Going back.")
+            return
+        self._auto_close_loops(close_fiducial_loops, close_odometry_loops)
+
+    def _auto_close_loops(self, close_fiducial_loops, close_odometry_loops, *args):
+        """Automatically find and close all loops in the graph."""
+        response = self._map_processing_client.process_topology(
+            params=map_processing_pb2.ProcessTopologyRequest.Params(
+                do_fiducial_loop_closure=wrappers.BoolValue(value=close_fiducial_loops),
+                do_odometry_loop_closure=wrappers.BoolValue(value=close_odometry_loops)),
+            modify_map_on_server=True)
+        print("Created {} new edge(s).".format(len(response.new_subgraph.edges)))
+    
+    def _record_waypoint(self, name):
+        self._recording_client.create_waypoint(waypoint_name=name)
+        print(f'Waypoint {name} Recorded.')
+
+    def _get_waypoint(self, id):
+        """Get waypoint from graph (return None if waypoint not found)"""
+
+        if self._current_graph is None:
+            self._current_graph = self._graph_nav_client.download_graph()
+
+        for waypoint in self._current_graph.waypoints:
+            if waypoint.id == id:
+                return waypoint
+
+        print('ERROR: Waypoint {} not found in graph.'.format(id))
+        return None
+
+    def _get_transform(self, from_wp, to_wp):
+        """Get transform from from-waypoint to to-waypoint."""
+
+        from_se3 = from_wp.waypoint_tform_ko
+        from_tf = SE3Pose(
+            from_se3.position.x, from_se3.position.y, from_se3.position.z,
+            Quat(w=from_se3.rotation.w, x=from_se3.rotation.x, y=from_se3.rotation.y,
+                 z=from_se3.rotation.z))
+
+        to_se3 = to_wp.waypoint_tform_ko
+        to_tf = SE3Pose(
+            to_se3.position.x, to_se3.position.y, to_se3.position.z,
+            Quat(w=to_se3.rotation.w, x=to_se3.rotation.x, y=to_se3.rotation.y,
+                 z=to_se3.rotation.z))
+
+        from_T_to = from_tf.mult(to_tf.inverse())
+        return from_T_to.to_proto()
+    
+    '''
+    Functions to control the arm of the robot
+    '''
     def arm_control_wasd(self):
         # Print helper messages
         print("[wasd]: Radial/Azimuthal control")
@@ -550,6 +955,152 @@ class SPOT:
         except (ResponseError, RpcError, LeaseBaseError) as err:
             print(f'Failed {desc}: {err}')
             return None
+    '''
+    Custom Long-horizon tasks
+    '''
+    def estimate_obj_distance(self, image_depth_response, bbox):
+        ## Estimate the distance to the target object by estimating the depth image
+        # Depth is a raw bytestream
+        cv_depth = np.frombuffer(image_depth_response.shot.image.data, dtype=np.uint16)
+        cv_depth = cv_depth.reshape(image_depth_response.shot.image.rows,
+                                    image_depth_response.shot.image.cols)
+        
+        # Visualize the depth image
+        # cv2.applyColorMap() only supports 8-bit; 
+        # convert from 16-bit to 8-bit and do scaling
+        min_val = np.min(cv_depth)
+        max_val = np.max(cv_depth)
+        depth_range = max_val - min_val
+        depth8 = (255.0 / depth_range * (cv_depth - min_val)).astype('uint8')
+        depth8_rgb = cv2.cvtColor(depth8, cv2.COLOR_GRAY2RGB)
+        depth_color = cv2.applyColorMap(depth8_rgb, cv2.COLORMAP_JET)
+
+
+        # Save the image locally
+        filename = os.path.join("images", "initial_search_depth.png")
+        cv2.imwrite(filename, depth_color)
+        # Convert the value into real-world distance & Find the average value within bbox
+        dist_avg = 0
+        dist_count = 0
+        dist_scale = image_depth_response.source.depth_scale
+
+        for i in range(int(bbox[1]), int(bbox[3])):
+            for j in range((int(bbox[0])), int(bbox[2])):
+                if cv_depth[i, j] != 0:
+                    dist_avg += cv_depth[i, j] / dist_scale
+                    dist_count += 1
+        
+        distance = dist_avg / dist_count
+        return distance
+
+    def estimate_obj_pose_hand(self, bbox, image_response, distance):
+        ## Estimate the target object pose (indicated by the bounding box) in hand frame
+        bbox_center = [int((bbox[1] + bbox[3])/2), int((bbox[0] + bbox[2])/2)]
+        pick_x, pick_y = bbox_center
+        # Obtain the camera inforamtion
+        camera_info = image_response.source
+        
+        w = camera_info.cols
+        h = camera_info.rows
+        fl_x = camera_info.pinhole.intrinsics.focal_length.x
+        k1= camera_info.pinhole.intrinsics.skew.x
+        cx = camera_info.pinhole.intrinsics.principal_point.x
+        fl_y = camera_info.pinhole.intrinsics.focal_length.y
+        k2 = camera_info.pinhole.intrinsics.skew.y
+        cy = camera_info.pinhole.intrinsics.principal_point.y
+
+        pinhole_camera_proj = np.array([
+            [fl_x, 0, cx, 0],
+            [0, fl_y, cy, 0],
+            [0, 0, 1, 0]
+        ])
+        pinhole_camera_proj = np.float32(pinhole_camera_proj) # Converted into float type
+
+        # Calculate the object's pose in hand camera frame
+        initial_guess = [1, 1, 10]
+        def equations(vars):
+            x, y, z = vars
+            eq = [
+                pinhole_camera_proj[0][0] * x + pinhole_camera_proj[0][1] * y + pinhole_camera_proj[0][2] * z - pick_x * z,
+                pinhole_camera_proj[1][0] * x + pinhole_camera_proj[1][1] * y + pinhole_camera_proj[1][2] * z - pick_y * z,
+                x * x + y * y + z * z - distance * distance
+            ]
+            return eq
+
+        root = fsolve(equations, initial_guess)
+        # Correct the frame conventions in hand frame & pinhole model
+        # pinhole model: z-> towards object, x-> rightward, y-> downward
+        # hand frame in SPOT: x-> towards object, y->rightward
+        result = SE3Pose(x=root[2], y=-root[0], z=-root[1], rot=Quat(w=1, x=0, y=0, z=0))
+        return result
+    def correct_body(self, obj_pose_hand):
+        # Find the object pose in body frame
+        robot_state = self.state_client.get_robot_state()
+        body_T_hand = frame_helpers.get_a_tform_b(\
+                    robot_state.kinematic_state.transforms_snapshot,
+                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, \
+                    frame_helpers.HAND_FRAME_NAME)
+        body_T_obj = body_T_hand * obj_pose_hand
+
+        # Rotate the body 
+        body_T_obj_se2 = body_T_obj.get_closest_se2_transform()
+
+        # Command the robot to rotate its body
+        move_command = RobotCommandBuilder.synchro_trajectory_command_in_body_frame(\
+            0, 0, body_T_obj_se2.angle, \
+                robot_state.kinematic_state.transforms_snapshot, \
+                params=self.get_walking_params(0.6, 1))
+        id = self.command_client.robot_command(command=move_command, \
+                                               end_time_secs=time.time() + 10)
+        block_for_trajectory_cmd(self.command_client,
+                                    cmd_id=id, 
+                                    feedback_interval_secs=5, 
+                                    timeout_sec=10,
+                                    logger=None)
+
+
+
+    def move_base_arc(self, obj_pose_hand:SE3Pose, angle):
+        # Find the object pose in body frame
+        robot_state = self.state_client.get_robot_state()
+        body_T_hand = frame_helpers.get_a_tform_b(\
+                    robot_state.kinematic_state.transforms_snapshot,
+                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME, \
+                    frame_helpers.HAND_FRAME_NAME)
+        body_T_obj = body_T_hand * obj_pose_hand
+
+        # Rotate the robot base w.r.t the object pose
+        body_T_obj_mat = body_T_obj.to_matrix()
+        rot_mat = R.from_rotvec([0, 0, angle]).as_matrix()
+        rot = np.eye(4)
+        rot[0:3, 0:3] = rot_mat
+        body_T_target = body_T_obj_mat @ rot @ np.linalg.inv(body_T_obj_mat)
+        body_T_target = SE3Pose.from_matrix(body_T_target)
+        odom_T_body = frame_helpers.get_a_tform_b(\
+                    robot_state.kinematic_state.transforms_snapshot,
+                    frame_helpers.ODOM_FRAME_NAME, \
+                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
+        odom_T_target = odom_T_body * body_T_target
+        # Send the command to move the robot base
+        odom_T_target_se2 = odom_T_target.get_closest_se2_transform()
+        # Command the robot to open its gripper
+        gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(1)
+        move_command = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
+            odom_T_target_se2.x, odom_T_target_se2.y, odom_T_target_se2.angle, \
+                frame_name=ODOM_FRAME_NAME, \
+                params=self.get_walking_params(0.6, 1),\
+                build_on_command=gripper_command)
+        id = self.command_client.robot_command(command=move_command, \
+                                               end_time_secs=time.time() + 10)
+        block_for_trajectory_cmd(self.command_client,
+                                    cmd_id=id, 
+                                    feedback_interval_secs=5, 
+                                    timeout_sec=10,
+                                    logger=None)
+        print("Moving done")
+
+
+    
 
 ## Environment for Spot in RL
 # Reset the seed
@@ -569,7 +1120,7 @@ def gen_params(self, batch_size=None) -> TensorDictBase:
                 {
                     "max_velocity": 0.6,
                     "max_angular_velocity": 1.0,
-                    "max_range": 1.5,
+                    "max_range": 1.0,
                     "max_angle": np.pi,
                     "dt": 1.0,
                 },
@@ -617,6 +1168,9 @@ class SpotRLEnvSE2(EnvBase):
         self.set_seed(seed)
 
         self.robot = robot
+
+        # Whether to use graphnav service on SPOT to determine its own pose
+        self.graphnav = (self.robot._current_graph is not None)
 
     # Helpers: _make_step and gen_params
     gen_params = gen_params
@@ -760,7 +1314,7 @@ class SpotRLEnvSE2(EnvBase):
         ptheta = ptheta.clamp(-tensordict["params", "max_angle"], tensordict["params", "max_angle"])
         # Take a step in the environment
         self.robot.send_pose_command_se2(px, py, ptheta, exec_time = float(dt))
-        obs_pose = self.robot.get_base_pose_se2()
+        obs_pose = self.robot.get_base_pose_se2(graphnav = self.graphnav)
         # print(obs_pose)
         # The ODE of motion of equation
         nx = obs_pose.position.x

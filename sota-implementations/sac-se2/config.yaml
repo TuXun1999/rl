@@ -8,8 +8,8 @@ env:
 
 # collector
 collector:
-  total_frames: 1_0000
-  prior_frames: 1_0000
+  total_frames: 1_200
+  prior_frames: 1_200
   init_random_frames: 50
   frames_per_batch: 25
   init_env_steps: 100
@@ -61,3 +61,6 @@ compile:
 
 # Spot robot
 hostname: 192.168.80.3
+session_name: test
+new_graph: True
+graph_path: "/home/txramsey/large_object_rearrangement/rl/sota-implementations/sac-se2/downloaded_graph"

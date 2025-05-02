@@ -2,13 +2,13 @@
 env:
   name: SE2
   task: ""
-  library: "se2"
+  library: "spot-body-velocity"
   max_episode_steps: 40
   seed: 42
 
 # collector
 collector:
-  total_frames: 1_200
+  total_frames: 1200
   prior_frames: 1_200
   init_random_frames: 50
   frames_per_batch: 25

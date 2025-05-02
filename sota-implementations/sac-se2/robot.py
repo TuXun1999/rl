@@ -148,8 +148,12 @@ class SPOT:
         
         # Clients for GraphNav service
         # Filepath for the location to put the downloaded graph and snapshots.
-        self._download_filepath = options.graph_path
-        self._upload_filepath = self._download_filepath
+        if hasattr(options, "graph_path"):
+            self._download_filepath = options.graph_path
+            self._upload_filepath = self._download_filepath
+        else:
+            self._download_filepath = "./downloaded_graph"
+            self._upload_filepath = self._download_filepath
 
         # Crate metadata for the recording session.
         if hasattr(options, "session_name"):
@@ -182,12 +186,7 @@ class SPOT:
         self._current_edge_snapshots = dict()  # maps id to edge snapshot
         self._current_annotation_name_to_wp_id = dict()
         
-        
-        # Estimated fid poses in robot's body frame
-        self.fid = False
-        self.fid_poses = None
-        self.fid_frame = None
-        self._max_attempts = 1000
+        self.graphnav_origin = SE3Pose.from_identity()
         
         # Verification before the formal task
         assert self.robot.has_arm(), 'Robot requires an arm to run this example.'
@@ -285,129 +284,28 @@ class SPOT:
     '''
     Find & Execute the SE2 pose of the base of the robot
     '''
-    # Find fiducial objects using world_object service
-    def get_fiducial_objects(self):
-        """Get all fiducials that Spot detects with its perception system."""
-        # Get all fiducial objects (an object of a specific type).
-        request_fiducials = [world_object_pb2.WORLD_OBJECT_APRILTAG]
-        fiducial_objects = self.world_object_client.list_world_objects(
-            object_type=request_fiducials).world_objects
-        if len(fiducial_objects):
-            # Return all the detected fiducials.
-            return fiducial_objects
-        # Return none if no fiducials are found.
-        return None
     
-    def read_fid(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True):
-        attempts = 0
-        self.fid_frame = frame_name
-        while attempts <= self._max_attempts:
-            self.fid = False
-            self.fid_ids = []
-            if use_world_object_service:
-                # Get the fiducial object Spot detects with the world object service.
-                fiducials = self.get_fiducial_objects()
-                if fiducials is not None:
-                    self.fid_poses = []
-                    for fiducial in fiducials:
-                        vision_tform_fiducial = get_a_tform_b(
-                            fiducial.transforms_snapshot, frame_name,
-                            fiducial.apriltag_properties.frame_name_fiducial)
-                        self.fid_poses.append(vision_tform_fiducial)
-                        self.fid_ids.append(fiducial.apriltag_properties.tag_id)     
-            else:
-                print("Not supported yet")
-                assert False
-
-            
-            if len(self.fid_poses) != 0:
-                self.fid = True
-                break
-        self.fid_initial_vision_tform_body = get_a_tform_b(\
-                    self.state_client.get_robot_state().kinematic_state.transforms_snapshot,
-                    frame_helpers.ODOM_FRAME_NAME, \
-                    frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
-        return self.fid
-    
-    def get_base_pose_se2_fid(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True):
-        attempts = 0
-        # Only support recovering the frame where fids are defined
-        assert frame_name == self.fid_frame
-        while attempts <= self._max_attempts:
-            if use_world_object_service:
-                # Get the fiducial object Spot detects with the world object service.
-                fiducials = self.get_fiducial_objects()
-                vision_body_guesses = []
-                if fiducials is not None:
-                    for fiducial in fiducials:
-                        fiducial_tform_body = get_a_tform_b(
-                            fiducial.transforms_snapshot, \
-                            fiducial.apriltag_properties.frame_name_fiducial,\
-                            BODY_FRAME_NAME)
-                        fid_id = fiducial.apriltag_properties.tag_id
-                        vision_tform_fid = self.fid_poses[self.fid_ids.index(fid_id)]
-                        vision_tform_body = vision_tform_fid.mult(fiducial_tform_body)
-                        body_tform_gpe = get_a_tform_b(\
-                            self.state_client.get_robot_state().kinematic_state.transforms_snapshot,
-                            frame_helpers.BODY_FRAME_NAME, \
-                            frame_helpers.GRAV_ALIGNED_BODY_FRAME_NAME)
-                        vision_tform_gpe = vision_tform_body.mult(body_tform_gpe)
-                        vision_body_guesses.append(vision_tform_gpe)
-                    break
-                else:
-                    print("Unable to find any fid. Use non-visual method")
-                     # The function to get the robot's base pose in SE2
-                    robot_state = self.state_client.get_robot_state()
-                    odom_T_base = frame_helpers.get_a_tform_b(\
-                        robot_state.kinematic_state.transforms_snapshot, frame_name, GRAV_ALIGNED_BODY_FRAME_NAME)
-                    return odom_T_base.get_closest_se2_transform()
-            else:
-                print("Not supported yet")
-                assert False
-        def average_SE3_poses(se3poses):
-            x = 0
-            y = 0
-            z = 0
-            rx = 0
-            ry = 0
-            rz = 0
-            rw = 0
-            for se3pose in se3poses:
-                x += se3pose.position.x
-                y += se3pose.position.y
-                z += se3pose.position.z
-                rx += se3pose.rotation.x
-                ry += se3pose.rotation.y
-                rz += se3pose.rotation.z
-                rw += se3pose.rotation.w 
-            x /= len(se3poses)
-            y /= len(se3poses)
-            z /= len(se3poses)
-            ry /= len(se3poses)
-            rx /= len(se3poses)
-            rz /= len(se3poses)
-            rw /= len(se3poses)
-            
-            final_pose = SE3Pose(x=x, y=y, z=z, rot=Quat(w=rw, x=rx, y=ry, z=rz))
-            return final_pose
-        print(vision_body_guesses[0])
-        return average_SE3_poses(vision_body_guesses).get_closest_se2_transform()
-    
-    def get_base_pose_se2_graphnav(self, frame_name = ODOM_FRAME_NAME):
+    def get_base_pose_se2_graphnav(self, frame_name = ODOM_FRAME_NAME, seed = False):
         # The function to get the robot's base pose in SE2 using waypoints in GraphNav
         state = self._graph_nav_client.get_localization_state()
-
         # NOTE: Unsure if this method still suffers from the motion drift issue
         # An alternative way is to use recording_tform_body
         # odom_tform_body = get_odom_tform_body(state.robot_kinematics.transforms_snapshot)
-
-        waypoint_tform_body = state.localization.waypoint_tform_body
-        waypoint_id = state.localization.waypoint_id
-        waypoint = self._get_waypoint(waypoint_id)
-        odom_tform_body = (SE3Pose.from_proto(waypoint.waypoint_tform_ko).inverse()).mult(waypoint_tform_body)
+        if seed is True:
+            # If seed_tform_body is available, use it
+            seed_tform_body = SE3Pose.from_proto(state.localization.seed_tform_body)
+            # Find the pose in the origin
+            seed_origin_tform_body = self.seed_tform_origin.inverse().mult(seed_tform_body)
+            odom_tform_body = seed_origin_tform_body
+        else:
+            # If seed_tform_body is not available, use the KO frame
+            waypoint_tform_body = SE3Pose.from_proto(state.localization.waypoint_tform_body)
+            waypoint_id = state.localization.waypoint_id
+            waypoint = self._get_waypoint(waypoint_id)
+            odom_tform_body = (SE3Pose.from_proto(waypoint.waypoint_tform_ko).inverse()).mult(waypoint_tform_body)
         return odom_tform_body.get_closest_se2_transform()
     def get_base_pose_se2(self, frame_name = ODOM_FRAME_NAME, use_world_object_service = True,\
-                        graphnav = False):
+                        graphnav = False, seed = False):
         if graphnav is False:
             # The function to get the robot's base pose in SE2
             robot_state = self.state_client.get_robot_state()
@@ -415,17 +313,17 @@ class SPOT:
                 robot_state.kinematic_state.transforms_snapshot, frame_name, GRAV_ALIGNED_BODY_FRAME_NAME)
             return odom_T_base.get_closest_se2_transform()
         else:
-            return self.get_base_pose_se2_graphnav()
+            return self.get_base_pose_se2_graphnav(seed = seed)
     
-    def send_velocit_command_se2(self, vx, vy, vtheta, exec_time = 1.5):
+    def send_velocity_command_se2(self, vx, vy, vtheta, exec_time = 1.0):
         # The function to send the se2 synchro velocity command to the robot
         move_cmd = RobotCommandBuilder.synchro_velocity_command(\
-            v_x=vx, v_y=vy, v_rot=vtheta)
-
-        cmd_id = self.command_client.robot_command(command=move_cmd,
+            v_x=vx, v_y=vy, v_rot=vtheta,\
+                params=self.get_walking_params(0.6, 1))
+        cmd_id = self.command_client.robot_command(command=move_cmd,\
                             end_time_secs=time.time() + exec_time)
         # Wait until the robot reports that it is at the goal.
-        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=4)
+        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=exec_time + 0.5)
     def send_pose_command_se2(self, x, y, theta, exec_time = 1.5, frame_name = ODOM_FRAME_NAME):
         # The function to send the pose command to move the robot to the desired pose
         move_cmd = RobotCommandBuilder.synchro_se2_trajectory_point_command(\
@@ -436,11 +334,16 @@ class SPOT:
         cmd_id = self.command_client.robot_command(command=move_cmd,\
                                 end_time_secs = time.time() + exec_time)
         # Wait until the robot reports that it is at the goal.
-        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=2.0)
+        block_for_trajectory_cmd(self.command_client, cmd_id, timeout_sec=exec_time + 0.5)
 
     '''
     GraphNav services
     '''
+    def get_graphnav_origin(self):
+        """ Returns seed_tform_body. """
+        state = self._graph_nav_client.get_localization_state()
+        gn_origin_tform_body = state.localization.seed_tform_body
+        return SE3Pose.from_proto(gn_origin_tform_body)
     def create_graph(self, radius = 1.0, waypoint_num = 20):
         '''
         Function to create a new graph on the robot.
@@ -448,19 +351,21 @@ class SPOT:
         # Record the starting state of the robot.
         self.odom_tform_recording = get_odom_tform_body(self.state_client.get_robot_state().kinematic_state.transforms_snapshot)
         # Clear the map on the robot.
+        self._stop_recording()
         self._clear_map()
         # Start recording a new map.
         self._start_recording()
-
+        # Create a new waypoint at the robot's current location.
+        self._create_default_waypoint()
+        self.seed_tform_origin = self.get_graphnav_origin()
         # Create waypoints by a random walk
         for i in range(waypoint_num):
-            # Create a new waypoint at the robot's current location.
-            self._create_default_waypoint()
             # Move the robot to a random location.
             x = np.random.uniform(-radius, radius)
             y = np.random.uniform(-radius, radius)
             theta = np.random.uniform(0, 2 * np.pi)
-            self.send_pose_command_se2(x, y, theta, exec_time=1.5)
+            # At the start, the motion drift of odom is not severe. 
+            self.send_pose_command_se2(x, y, theta, exec_time=3.0)
 
             # Create a waypoint at the robot's location
             self._record_waypoint("waypoint_{}".format(i))
@@ -501,6 +406,7 @@ class SPOT:
                    "attempt to localize to the map.")
             return
         try:
+            self.graphnav_origin = self.get_graphnav_origin()
             status = self._recording_client.start_recording(
                 recording_environment=self._recording_environment)
             print("Successfully started recording a map.")
@@ -1108,36 +1014,7 @@ class SPOT:
     
 
 ## Environment for Spot in RL
-# Reset the seed
-def _set_seed(self, seed: Optional[int]):
-    rng = torch.Generator(device=self.device)
-    rng = rng.manual_seed(seed)
-    self.rng = rng
-# Define the parameters
-def gen_params(self, batch_size=None) -> TensorDictBase:
-    """Returns a ``tensordict`` containing the physical parameters such 
-    as gravitational force and torque or speed limits."""
-    if batch_size is None:
-        batch_size = []
-    td = TensorDict(
-        {
-            "params": TensorDict(
-                {
-                    "max_velocity": 0.6,
-                    "max_angular_velocity": 1.0,
-                    "max_range": 1.0,
-                    "max_angle": np.pi,
-                    "dt": 1.0,
-                },
-                [],
-            )
-        },
-        [],
-        device=self.device
-    )
-    if batch_size:
-        td = td.expand(batch_size).contiguous()
-    return td
+
 
 
 # Helper function to make a composite from tensordict
@@ -1178,8 +1055,36 @@ class SpotRLEnvSE2(EnvBase):
         self.graphnav = (self.robot._current_graph is not None)
 
     # Helpers: _make_step and gen_params
-    gen_params = gen_params
-    _set_seed = _set_seed
+    # Reset the seed
+    def _set_seed(self, seed: Optional[int]):
+        rng = torch.Generator(device=self.device)
+        rng = rng.manual_seed(seed)
+        self.rng = rng
+    # Define the parameters
+    def gen_params(self, batch_size=None) -> TensorDictBase:
+        """Returns a ``tensordict`` containing the physical parameters such 
+        as gravitational force and torque or speed limits."""
+        if batch_size is None:
+            batch_size = []
+        td = TensorDict(
+            {
+                "params": TensorDict(
+                    {
+                        "max_velocity": 0.6,
+                        "max_angular_velocity": 1.0,
+                        "max_range": 1.0,
+                        "max_angle": np.pi,
+                        "dt": 1.5,
+                    },
+                    [],
+                )
+            },
+            [],
+            device=self.device
+        )
+        if batch_size:
+            td = td.expand(batch_size).contiguous()
+        return td
 
 
 
@@ -1347,5 +1252,221 @@ class SpotRLEnvSE2(EnvBase):
         # Update the robot to use
         self.robot = robot
 
+# The new RL environment that generates body velocities instead
+class SpotRLEnvBodyVelocitySE2(EnvBase):
+    metadata = {
+        "render_modes": ["human", "rgb_array"],
+        "render_fps": 30,
+    } # Seems to be related to rendering
+    batch_locked = False # Usually set to false for "stateless" environment
+
+    def __init__(self, robot, td_params=None, seed=None, device="cpu"):
+        if td_params is None:
+            td_params = self.gen_params()
+
+        super().__init__(device=device, batch_size=[])
+        self._make_spec(td_params)
+        if seed is None:
+            seed = torch.empty((), dtype=torch.int64).random_().item()
+        self.set_seed(seed)
+
+        self.robot = robot
+
+        # Whether to use graphnav service on SPOT to determine its own pose
+        self.graphnav = (self.robot._current_graph is not None)
+
+    # Helpers: _make_step and gen_params
+    # Reset the seed
+    def _set_seed(self, seed: Optional[int]):
+        rng = torch.Generator(device=self.device)
+        rng = rng.manual_seed(seed)
+        self.rng = rng
+    # Define the parameters
+    def gen_params(self, batch_size=None) -> TensorDictBase:
+        """Returns a ``tensordict`` containing the physical parameters such 
+        as gravitational force and torque or speed limits."""
+        if batch_size is None:
+            batch_size = []
+        td = TensorDict(
+            {
+                "params": TensorDict(
+                    {
+                        "max_velocity": 0.6,
+                        "max_angular_velocity": 1.0,
+                        "max_range": 1.0,
+                        "max_angle": np.pi,
+                        "dt": 1.0,
+                    },
+                    [],
+                )
+            },
+            [],
+            device=self.device
+        )
+        if batch_size:
+            td = td.expand(batch_size).contiguous()
+        return td
+
+
+
+    # Create the specification for observation, state, action
+    def _make_spec(self, td_params):
+        # Under the hood, this will populate self.output_spec["observation"]
+        self.observation_spec = Composite(
+            x=Bounded(
+                low=-torch.tensor(DEFAULT_X),
+                high=torch.tensor(DEFAULT_X),
+                shape=(),
+                dtype=torch.float32,
+            ),
+            y=Bounded(
+                low=-torch.tensor(DEFAULT_X),
+                high=torch.tensor(DEFAULT_X),
+                shape=(),
+                dtype=torch.float32,
+            ),
+            theta=Bounded(
+                low=-torch.tensor(DEFAULT_ANGLE),
+                high=torch.tensor(DEFAULT_ANGLE),
+                shape=(),
+                dtype=torch.float32,
+            ),
+            # we need to add the ``params`` to the observation specs, as we want
+            # to pass it at each step during a rollout
+            params=make_composite_from_td(td_params["params"]),
+            shape=(),
+        )
+        # since the environment is stateless, we expect the previous output as input.
+        # For this, ``EnvBase`` expects some state_spec to be available
+        self.state_spec = self.observation_spec.clone()
+        # action-spec will be automatically wrapped in input_spec when
+        # `self.action_spec = spec` will be called supported
+        # NOTE: Might be a bug here
+        self.action_spec = Bounded(
+            low=np.array(\
+                [-td_params["params", "max_velocity"], \
+                    -td_params["params", "max_velocity"],\
+                        -td_params["params", "max_angular_velocity"]]),
+            high=np.array(\
+                [td_params["params", "max_velocity"], \
+                    td_params["params", "max_velocity"],\
+                        td_params["params", "max_angular_velocity"]]),
+            shape=(3,),        
+            dtype=torch.float32,
+        )
+        
+
+        self.reward_spec = Unbounded(shape=(*td_params.shape, 1))
+    
+    def _reset(self, tensordict):
+        if tensordict is None or tensordict.is_empty() or tensordict.get("_reset") is not None:
+            # if no ``tensordict`` is passed, we generate a single set of hyperparameters
+            # Otherwise, we assume that the input ``tensordict`` contains all the relevant
+            # parameters to get started.
+            tensordict = self.gen_params(batch_size=self.batch_size)
+
+        # Reset RL environment by commanding spot to follow a random body velocity
+        velocity_high = tensordict["params", "max_velocity"]
+        velocity_angle_high = tensordict["params", "max_angular_velocity"]
+        high_x = torch.tensor(velocity_high, device=self.device)
+        high_angle = torch.tensor(velocity_angle_high, device=self.device)
+        low_x = -high_x
+        low_angle = -high_angle
+
+        gx = (
+            torch.rand(tensordict.shape, generator=self.rng, device=self.device)
+            * (high_x - low_x)
+            + low_x
+        )
+        gy = (
+            torch.rand(tensordict.shape, generator=self.rng, device=self.device)
+            * (high_x - low_x)
+            + low_x
+        )
+        gt = (
+            torch.rand(tensordict.shape, generator=self.rng, device=self.device)
+            * (high_angle- low_angle)
+            + low_angle
+        )
+        # Command the SPOT to go to that place
+        dt = float(tensordict["params", "dt"].cpu().numpy())
+        self.robot.send_velocity_command_se2(gx, gy, gt, exec_time = dt)
+        obs_pose = self.robot.get_base_pose_se2(graphnav = self.graphnav, seed = True)
+        
+        # Extract the statistics
+        x = obs_pose.position.x
+        y = obs_pose.position.y
+        theta = obs_pose.angle
+
+        out = TensorDict(
+            {
+                "x": torch.tensor(x).to(device=self.device),
+                "y": torch.tensor(y).to(device=self.device),
+                "theta": torch.tensor(theta).to(device=self.device),
+                "params": tensordict["params"],
+            },
+            batch_size=tensordict.shape,
+        )
+        return out
+    
+    def _step(self, tensordict):
+        x, y, theta = tensordict["x"], tensordict["y"], tensordict["theta"]
+
+        dt = tensordict["params", "dt"]
+        # print("===Test===")
+        # print([x,y,theta])
+        # Read the value
+        u = tensordict["action"]
+        if len(u.shape) == 1:
+            vx = u[0].clamp(-tensordict["params", "max_velocity"], \
+                            tensordict["params", "max_velocity"])
+            vy = u[1].clamp(-tensordict["params", "max_velocity"], \
+                            tensordict["params", "max_velocity"])
+            vtheta = u[2].clamp(-tensordict["params", "max_angular_velocity"], \
+                            tensordict["params", "max_angular_velocity"])
+        else:
+            vx = u[:, 0].clamp(-tensordict["params", "max_velocity"], \
+                            tensordict["params", "max_velocity"])
+            vy = u[:, 1].clamp(-tensordict["params", "max_velocity"], \
+                            tensordict["params", "max_velocity"])
+            vtheta = u[:, 2].clamp(-tensordict["params", "max_angular_velocity"], \
+                            tensordict["params", "max_angular_velocity"])
+        dist = (x ** 2 + y ** 2)**0.5
+        # costs_location = -dist + torch.exp(-dist) + torch.exp(-10*dist)
+        # costs_yaw = torch.exp(-abs(theta)) + torch.exp(-10*abs(theta))
+        # costs = costs_location + costs_yaw
+        costs = -dist - 0.4*abs(theta)
+        
+        # Take a step in the environment
+        # Send the body velocity command
+        self.robot.send_velocity_command_se2(vx, vy, vtheta, exec_time = float(dt))
+        # Obtain the pose in seed-origin frame
+        obs_pose = self.robot.get_base_pose_se2(graphnav = self.graphnav, seed = True)
+        # print(obs_pose)
+        # The ODE of motion of equation
+        nx = obs_pose.position.x
+        ny = obs_pose.position.y
+        ntheta = obs_pose.angle
+
+        # The reward is depending on the current state
+        reward = costs.view(*tensordict.shape, 1) # Expand the dim to be consistent with the shape?
+        done = torch.zeros_like(reward, dtype=torch.bool)
+        mask = reward > -0.25 #2.5
+        done[mask] = True
+        out = TensorDict(
+            {
+                "x": torch.tensor(nx).to(device=self.device),
+                "y": torch.tensor(ny).to(device=self.device),
+                "theta": torch.tensor(ntheta).to(device=self.device),
+                "params": tensordict["params"],
+                "reward": reward,
+                "done": done,
+            },
+            tensordict.shape,
+        )
+        return out
+    def update_robot(self, robot):
+        # Update the robot to use
+        self.robot = robot
 def create_spot_env(robot, transform_state_dict = None, device = "cpu"):
     pass

@@ -31,41 +31,29 @@ def hello_arm(config):
     
     with robot.lease_alive():
         robot.power_on_stand()
-
-
+        start_pose_odom = robot.get_base_pose_se2()
+        x = start_pose_odom.position.x
+        y = start_pose_odom.position.y
+        theta = start_pose_odom.angle
         # Read the fiducials
         new_graph = True
         if new_graph is True:
             robot.create_graph()
         else:
             robot._upload_graph_and_snapshots()
-        attempts = 1
-        # Move the robot to several different places
-        # Check the estimated pose from fiducials
-        for i in range(attempts):
-            x = np.random.uniform(-1.0, 1.0)
-            y = np.random.uniform(-1.0, 1.0)
-            theta = np.random.uniform(-np.pi, np.pi)
-            robot.send_pose_command_se2(x=x, y=y, theta=theta, exec_time=4.0)
-            # Read the SE2 pose from fiducials
-            se2pose_fid = robot.get_base_pose_se2_graphnav()
-            print("==Test==")
-            print("Goal pose: ")
-            print([x,y,theta])
-            print("Estimated pose from graphnav: ")
-            print([se2pose_fid.position.x, se2pose_fid.position.y, se2pose_fid.angle])
-            print("Estimated pose from spot: ")
-            se2pose_spot = robot.get_base_pose_se2()
-            print([se2pose_spot.position.x, se2pose_spot.position.y, se2pose_spot.angle])
-    
-        # print("***Check SPOT joint angles***")
-        # # Read the joint angles
-        # robot_state_client = robot.state_client
-        # robot_state = robot_state_client.get_robot_state()
-        # joint_angles = robot_state.kinematic_state.joint_states
-        # for joint in joint_angles:
-        #     print(joint.name)
-        #     print(joint.position)
+
+        # Move the robot back to the start pose
+        robot.send_pose_command_se2(x=x, y=y, theta=theta, exec_time=4.0)
+        # Read the SE2 pose from fiducials in seed frame
+        se2pose_fid = robot.get_base_pose_se2_graphnav(seed=True)
+        print("==Test==")
+        print("Goal pose: ")
+        print([x,y,theta])
+        print("Estimated pose from seed-origin frame (should be close to 0): ")
+        print([se2pose_fid.position.x, se2pose_fid.position.y, se2pose_fid.angle])
+        print("Estimated pose from spot: ")
+        se2pose_spot = robot.get_base_pose_se2()
+        print([se2pose_spot.position.x, se2pose_spot.position.y, se2pose_spot.angle])
 
 
         

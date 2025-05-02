@@ -220,32 +220,32 @@ def main(cfg: DictConfig):  # noqa: F821
         battery_state = robot.state_client.get_robot_state().battery_states[0]
         status = battery_state.Status.Name(battery_state.status)
         status = status[7:]  # get rid of STATUS_ prefix
-        if battery_state.charge_percentage.value < 10: # Too low battery
-            robot_current_pose = robot.get_base_pose_se2()
-            # Go back to original starting pose
-            robot.send_pose_command_se2(\
-                robot_start_pose.position.x, \
-                robot_start_pose.position.y,\
-                robot_start_pose.angle)
-            # Release the lease
-            robot.lease_return()
-            # Wait for the user to change the battery
-            input("Battery level too low... please change the battery, self-right it \
-                and release the control \n (Press any key to continue if done)")
+        # if battery_state.charge_percentage.value < 10: # Too low battery
+        #     robot_current_pose = robot.get_base_pose_se2()
+        #     # Go back to original starting pose
+        #     robot.send_pose_command_se2(\
+        #         robot_start_pose.position.x, \
+        #         robot_start_pose.position.y,\
+        #         robot_start_pose.angle)
+        #     # Release the lease
+        #     robot.lease_return()
+        #     # Wait for the user to change the battery
+        #     input("Battery level too low... please change the battery, self-right it \
+        #         and release the control \n (Press any key to continue if done)")
             
-            # Re-initialize the robot object
-            robot = SPOT(cfg)
-            robot.lease_alive()
-            robot.power_on_stand()
-            # Return the robot to the place where the training is paused
-            robot.send_pose_command_se2(\
-                robot_current_pose.position.x,
-                robot_current_pose.position.y,
-                robot_current_pose.angle
-                )
-            # Update the agents
-            train_env.update_robot(robot)
-            eval_env.update_robot(robot)
+        #     # Re-initialize the robot object
+        #     robot = SPOT(cfg)
+        #     robot.lease_alive()
+        #     robot.power_on_stand()
+        #     # Return the robot to the place where the training is paused
+        #     robot.send_pose_command_se2(\
+        #         robot_current_pose.position.x,
+        #         robot_current_pose.position.y,
+        #         robot_current_pose.angle
+        #         )
+        #     # Update the agents
+        #     train_env.update_robot(robot)
+        #     eval_env.update_robot(robot)
 
 
         with timeit("collect"):

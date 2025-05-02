@@ -66,6 +66,9 @@ def env_maker(cfg, device="cuda:0", transform_state_dict=None, from_pixels=False
     elif lib == "spot":
         env = create_se2_env("spot", robot=robot, transform_state_dict=transform_state_dict, device=device)
         return env
+    elif lib == "spot-body-velocity":
+        env = create_se2_env("spot-body-velocity", robot=robot, transform_state_dict=transform_state_dict, device=device)
+        return env
     else:
         raise NotImplementedError(f"Unknown lib {lib}.")
 
@@ -98,39 +101,6 @@ def get_env_stats(cfg, obs_norm_idx=-1, robot=None):
     transform_state_dict = t.state_dict()
     proof_env.close()
     return transform_state_dict
-def make_robot_rl_environment(cfg, logger, robot = None):
-    # """Make environments for training and evaluation."""
-    # Get the normalization stats from the random exploration in env
-    transform_state_dict = None #get_env_stats(cfg, robot = robot)
-    maker = functools.partial(env_maker, cfg, \
-                transform_state_dict=transform_state_dict, from_pixels=False, robot=robot)
-    parallel_env = ParallelEnv(
-        cfg.collector.env_per_collector,
-        EnvCreator(maker),
-        serial_for_single=True,
-    )
-    parallel_env.set_seed(cfg.env.seed)
-
-    train_env = apply_env_transforms(
-        parallel_env, max_episode_steps=cfg.env.max_episode_steps
-    )
-
-    maker = functools.partial(env_maker, cfg, \
-                    transform_state_dict=transform_state_dict, from_pixels=cfg.logger.video)
-    eval_env = TransformedEnv(
-        ParallelEnv(
-            cfg.logger.num_eval_envs,
-            EnvCreator(maker),
-            serial_for_single=True,
-        ),
-        train_env.transform.clone(),
-    )
-    eval_env.set_seed(0)
-    if cfg.logger.video:
-        eval_env = eval_env.append_transform(
-            VideoRecorder(logger, tag="rendered", in_keys=["pixels"])
-        )
-    return train_env, eval_env
 def make_environment(cfg, logger, robot = None):
     # """Make environments for training and evaluation."""
     # Get the normalization stats from the random exploration in env

@@ -178,4 +178,4 @@ Roms
 
 # Remove the downloaded graphs
 sota-implementations/sac-se2/downloaded_graph
-sota-implementations/td3-se2/outputs
+sota-implementations/sac-se2/outputs

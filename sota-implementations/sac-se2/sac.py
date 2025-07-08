@@ -311,25 +311,24 @@ def main(cfg: DictConfig):  # noqa: F821
     )
      
 
-    # robot = SPOT(cfg)
-    # transform_state_dict = get_env_stats(cfg)
-    # with robot.lease_alive():
-    #     robot.power_on_stand()
-    #     # Create the RL environment from the robot
-    #     spot_env = create_se2_env("spot", robot, transform_state_dict=transform_state_dict, device=device)
+    robot = SPOT(cfg)
+    with robot.lease_alive():
+        robot.power_on_stand()
+        # Create the RL environment from the robot
+        spot_env = create_se2_env("spot", robot, device=device)
 
-    #     # Inference on the trained policy
-    #     with set_exploration_type(
-    #             ExplorationType.DETERMINISTIC
-    #         ), torch.no_grad(), timeit("eval"):
+        # Inference on the trained policy
+        with set_exploration_type(
+                ExplorationType.DETERMINISTIC
+            ), torch.no_grad(), timeit("eval"):
                 
-    #             print("reset")
-    #             print("rollout")
-    #             rollout = spot_env.rollout(100, model[0], \
-    #                 auto_cast_to_device=True,
-    #                 break_when_any_done=True,)
-    #             eval_reward = rollout["next", "reward"].sum(-2).mean().item()
-    #             print(eval_reward)
+                print("reset")
+                print("rollout")
+                rollout = spot_env.rollout(100, model[0], \
+                    auto_cast_to_device=True,
+                    break_when_any_done=True,)
+                eval_reward = rollout["next", "reward"].sum(-2).mean().item()
+                print(eval_reward)
 
 
 if __name__ == "__main__":

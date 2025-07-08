@@ -5471,14 +5471,27 @@ class Tokenizer(UnaryTransform):
             return out, attention_mask
         return out
 
+    def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        # Override _inv_call to account for ragged dims
+        if not self.in_keys_inv:
+            return tensordict
+        for in_key, out_key in _zip_strict(self.in_keys_inv, self.out_keys_inv):
+            data = tensordict.get(out_key, None, as_padded_tensor=True)
+            if data is not None:
+                item = self._inv_apply_transform(data)
+                tensordict.set(in_key, item)
+            elif not self.missing_tolerance:
+                raise KeyError(f"'{out_key}' not found in tensordict {tensordict}")
+        return tensordict
+
     def call_tokenizer_inv_fn(self, value: Tensor):
         if value.ndim == 1:
             out = self.tokenizer.decode(
-                value, skip_special_tokens=self.skip_special_tokens
+                value.int(), skip_special_tokens=self.skip_special_tokens
             )
         else:
             out = self.tokenizer.batch_decode(
-                value, skip_special_tokens=self.skip_special_tokens
+                value.int(), skip_special_tokens=self.skip_special_tokens
             )
         device = self._str_device
         if isinstance(out, list):
@@ -6388,7 +6401,9 @@ class TensorDictPrimer(Transform):
         self, tensordict: TensorDictBase, next_tensordict: TensorDictBase
     ) -> TensorDictBase:
         for key in self.primers.keys(True, True):
-            if key not in next_tensordict.keys(True, True):
+            # We relax a bit the condition here, allowing nested but not leaf values to
+            #  be checked against
+            if key not in next_tensordict.keys(True, is_leaf=_is_leaf_nontensor):
                 prev_val = tensordict.get(key)
                 next_tensordict.set(key, prev_val)
         return next_tensordict
@@ -6433,11 +6448,16 @@ class TensorDictPrimer(Transform):
         if _reset.any():
             if self.single_default_value and callable(self.default_value):
                 if not _reset.all():
-                    tensordict_reset = torch.where(
-                        _reset,
-                        self.default_value(reset=_reset),
-                        tensordict_reset[_reset],
+                    # FIXME: use masked op
+                    tensordict_reset = tensordict_reset.clone()
+                    reset_val = self.default_value(reset=_reset)
+                    # This is safe because env.reset calls _update_during_reset which will discard the new data
+                    tensordict_reset = (
+                        self.container.full_observation_spec.zero().select(
+                            *reset_val.keys(True)
+                        )
                     )
+                    tensordict_reset[_reset] = reset_val
                 else:
                     resets = self.default_value(reset=_reset)
                     tensordict_reset.update(resets)

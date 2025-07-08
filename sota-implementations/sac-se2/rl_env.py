@@ -20,7 +20,7 @@ from torchrl.envs import (
 
 from torchrl.envs.transforms.transforms import _apply_to_composite
 from torchrl.envs.utils import check_env_specs, step_mdp
-from robot import SpotRLEnvSE2
+from robot import SpotRLEnvSE2, SpotRLEnvBodyVelocitySE2
 DEFAULT_X = 2.0
 DEFAULT_ANGLE = np.pi
 
@@ -212,9 +212,7 @@ def gen_params(self, batch_size=None) -> TensorDictBase:
                 {
                     "max_velocity": 0.6,
                     "max_angular_velocity": 1.0,
-                    "position_noise": 0.2,
-                    "angle_noise": 0.1,
-                    "dt": 1.0,
+                    "dt": 2.0,
                 },
                 [],
             )
@@ -306,6 +304,8 @@ def create_se2_env(env_name = "se2", robot = None, transform_state_dict = None, 
         env = SE2PointEnv(device=device)
     elif env_name == "spot":
         env = SpotRLEnvSE2(robot=robot, device=device)
+    elif env_name == "spot-body-velocity":
+        env = SpotRLEnvBodyVelocitySE2(robot=robot, device=device)
     # The first unsqueeze is to help stack the input to the network
     env = TransformedEnv(
         env,
@@ -343,5 +343,4 @@ def create_se2_env(env_name = "se2", robot = None, transform_state_dict = None, 
     #     env.transform[-1].loc.copy_(transform_state_dict["loc"])
     #     env.transform[-1].scale.copy_(transform_state_dict["scale"])
     
-
     return env

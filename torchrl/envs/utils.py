@@ -804,7 +804,16 @@ def check_env_specs(
             real_tensordict_select.filter_non_tensor_data().unbind(-1),
             fake_tensordict_select.filter_non_tensor_data().unbind(-1),
         ):
-            fake = fake.apply(lambda x, y: x.expand_as(y), real)
+
+            def expand(name, x, y):
+                try:
+                    return x.expand_as(y)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to expand fake tensor {name} with shape {x.shape} to real shape {y.shape}"
+                    ) from e
+
+            fake = fake.apply(expand, real, named=True, nested_keys=True)
             if (torch.zeros_like(real) != torch.zeros_like(fake)).any():
                 raise AssertionError(zeroing_err_msg())
 
@@ -1591,8 +1600,13 @@ def _make_compatible_policy(
             policy = TensorDictModule(policy, in_keys=in_keys, out_keys=out_keys)
         else:
             raise TypeError(
-                f"""Arguments to policy.forward are incompatible with entries in
-    env.observation_spec (got incongruent signatures: fun signature is {set(sig.parameters)} vs specs {set(next_observation)}).
+                f"""This error is raised because TorchRL tried to automatically wrap your policy in
+    a TensorDictModule. If you're confident the policy can directly process environment outputs, set
+    the `trust_policy` argument to `True` in the constructor.
+
+    Arguments to policy.forward are incompatible with entries in
+    env.observation_spec (got incongruent signatures:
+    the function signature is {set(sig.parameters)} but the specs have keys {set(next_observation)}).
     If you want TorchRL to automatically wrap your policy with a TensorDictModule
     then the arguments to policy.forward must correspond one-to-one with entries
     in env.observation_spec.

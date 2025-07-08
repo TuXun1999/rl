@@ -2,9 +2,9 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-"""SAC Example.
+"""TD3 Example.
 
-This is a simple self-contained example of a SAC training script.
+This is a simple self-contained example of a TD3 training script.
 
 It supports state environments like MuJoCo.
 
@@ -19,30 +19,26 @@ import numpy as np
 import torch
 import torch.cuda
 import tqdm
-from tensordict import TensorDict
 from tensordict.nn import CudaGraphModule
 from torchrl._utils import compile_with_warmup, timeit
 from torchrl.envs.utils import ExplorationType, set_exploration_type
-from torchrl.objectives import group_optimizers
 from torchrl.record.loggers import generate_exp_name, get_logger
-from torchrl.modules import  ActorCriticOperator
-from torchrl.modules.tensordict_module import SafeModule
 from utils import (
     dump_video,
     log_metrics,
     make_collector,
     make_environment,
     make_loss_module,
+    make_optimizer,
     make_replay_buffer,
-    make_sac_agent,
-    make_sac_optimizer,
-    make_spot_environment
+    make_td3_agent,
+    make_prior_collector,
+    make_prior_agent
 )
 
 torch.set_float32_matmul_precision("high")
-from spot import SPOT, SpotRLEnvSE2
-import bosdyn
-import argparse
+
+
 @hydra.main(version_base="1.1", config_path="", config_name="config")
 def main(cfg: DictConfig):  # noqa: F821
     device = cfg.network.device
@@ -51,15 +47,16 @@ def main(cfg: DictConfig):  # noqa: F821
             device = torch.device("cuda:0")
         else:
             device = torch.device("cpu")
-    device = torch.device(device)
+    else:
+        device = torch.device(device)
 
     # Create logger
-    exp_name = generate_exp_name("SAC_SE2", cfg.logger.exp_name)
+    exp_name = generate_exp_name("TD3", cfg.logger.exp_name)
     logger = None
     if cfg.logger.backend:
         logger = get_logger(
             logger_type=cfg.logger.backend,
-            logger_name="sac_logging",
+            logger_name="td3_logging",
             experiment_name=exp_name,
             wandb_kwargs={
                 "mode": cfg.logger.mode,
@@ -69,6 +66,7 @@ def main(cfg: DictConfig):  # noqa: F821
             },
         )
 
+    # Set seeds
     torch.manual_seed(cfg.env.seed)
     np.random.seed(cfg.env.seed)
 
@@ -76,9 +74,10 @@ def main(cfg: DictConfig):  # noqa: F821
     train_env, eval_env = make_environment(cfg, logger=logger, device=device)
 
     # Create agent
-    model, exploration_policy = make_sac_agent(cfg, train_env, eval_env, device)
+    model, exploration_policy = make_td3_agent(cfg, train_env, eval_env, device)
+    prior_model = make_prior_agent(cfg, device)
 
-    # Create SAC loss
+    # Create TD3 loss
     loss_module, target_net_updater = make_loss_module(cfg, model)
 
     compile_mode = None
@@ -92,7 +91,15 @@ def main(cfg: DictConfig):  # noqa: F821
 
     # Create off-policy collector
     collector = make_collector(
-        cfg, train_env, exploration_policy, compile_mode=compile_mode
+        cfg,
+        train_env,
+        exploration_policy,
+        compile_mode=compile_mode,
+        device=device,
+    )
+    prior_collector = make_prior_collector(
+        cfg, train_env, prior_model, compile_mode=compile_mode, \
+            total_frames=cfg.collector.prior_frames
     )
 
     # Create replay buffer
@@ -102,32 +109,44 @@ def main(cfg: DictConfig):  # noqa: F821
         buffer_size=cfg.replay_buffer.size,
         scratch_dir=cfg.replay_buffer.scratch_dir,
         device=device,
+        compile=bool(compile_mode),
     )
-
+    prior_replay_buffer = make_replay_buffer(
+        batch_size=cfg.optim.batch_size,
+        prb=cfg.replay_buffer.prb,
+        buffer_size=cfg.replay_buffer.size,
+        scratch_dir=cfg.replay_buffer.scratch_dir,
+        device=device,
+    )
     # Create optimizers
-    (
-        optimizer_actor,
-        optimizer_critic,
-        optimizer_alpha,
-    ) = make_sac_optimizer(cfg, loss_module)
-    optimizer = group_optimizers(optimizer_actor, optimizer_critic, optimizer_alpha)
-    del optimizer_actor, optimizer_critic, optimizer_alpha
+    optimizer_actor, optimizer_critic = make_optimizer(cfg, loss_module)
 
-    def update(sampled_tensordict):
+    prb = cfg.replay_buffer.prb
+
+    def update(sampled_tensordict, update_actor, prb=prb):
+
         # Compute loss
-        loss_td = loss_module(sampled_tensordict)
+        q_loss, *_ = loss_module.value_loss(sampled_tensordict)
 
-        actor_loss = loss_td["loss_actor"]
-        q_loss = loss_td["loss_qvalue"]
-        alpha_loss = loss_td["loss_alpha"]
+        # Update critic
+        q_loss.backward()
+        optimizer_critic.step()
+        optimizer_critic.zero_grad(set_to_none=True)
 
-        (actor_loss + q_loss + alpha_loss).sum().backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        # Update actor
+        if update_actor:
+            actor_loss, *_ = loss_module.actor_loss(sampled_tensordict)
 
-        # Update qnet_target params
-        target_net_updater.step()
-        return loss_td.detach()
+            actor_loss.backward()
+            optimizer_actor.step()
+            optimizer_actor.zero_grad(set_to_none=True)
+
+            # Update target params
+            target_net_updater.step()
+        else:
+            actor_loss = q_loss.new_zeros(())
+
+        return q_loss.detach(), actor_loss.detach()
 
     if cfg.compile.compile:
         update = compile_with_warmup(update, mode=compile_mode, warmup=1)
@@ -145,24 +164,51 @@ def main(cfg: DictConfig):  # noqa: F821
 
     init_random_frames = cfg.collector.init_random_frames
     num_updates = int(cfg.collector.frames_per_batch * cfg.optim.utd_ratio)
-    prb = cfg.replay_buffer.prb
+    delayed_updates = cfg.optim.policy_update_delay
+    eval_rollout_steps = cfg.env.max_episode_steps
     eval_iter = cfg.logger.eval_iter
     frames_per_batch = cfg.collector.frames_per_batch
-    eval_rollout_steps = cfg.env.max_episode_steps
+    update_counter = 0
 
     collector_iter = iter(collector)
     total_iter = len(collector)
 
-    for i in range(total_iter):
+    prior_collector_iter = iter(prior_collector)
+    total_prior_iter = len(prior_collector)
+
+    '''
+    Collect offline data
+    '''
+    for i in range(total_prior_iter):
+        timeit.printevery(num_prints=1000, total_count=total_iter, erase=True)
+        print("***Collecting offline data***")
+        with timeit("offline dataset"):
+            tensordict = next(prior_collector_iter)
+            # i = np.random.randint(tensordict.shape[0])
+            # j = 2
+            # print("===Test===")
+            # print([i, j])
+            # print(tensordict[i, j]["action"])
+            # print(tensordict[i, j]["x"])
+            # print(tensordict[i, j]["y"])
+            # print(tensordict[i, j]["theta"])
+            # print(tensordict[i, j]["next", "x"])
+            # print(tensordict[i, j]["next", "y"])
+            # print(tensordict[i, j]["next", "theta"])
+            # print(tensordict[i, j]["next", "reward"])
+            # assert False
+        with timeit("rb - extend"):
+            tensordict = tensordict.reshape(-1)
+            prior_replay_buffer.extend(tensordict)
+    
+    for _ in range(total_iter):
         timeit.printevery(num_prints=1000, total_count=total_iter, erase=True)
 
         with timeit("collect"):
-            init_td = train_env.reset(train_env.gen_params(batch_size=[frames_per_batch]))
-            tensordict = train_env.rollout(100, exploration_policy, \
-                                        tensordict=init_td, auto_reset=False)
+            tensordict = next(collector_iter)
 
         # Update weights of the inference policy
-        # collector.update_policy_weights_()
+        collector.update_policy_weights_()
 
         current_frames = tensordict.numel()
         pbar.update(current_frames)
@@ -174,25 +220,41 @@ def main(cfg: DictConfig):  # noqa: F821
 
         collected_frames += current_frames
 
-        # Optimization steps
         with timeit("train"):
+            # Optimization steps
             if collected_frames >= init_random_frames:
-                losses = TensorDict(batch_size=[num_updates])
-                for i in range(num_updates):
-                    with timeit("rb - sample"):
-                        # Sample from replay buffer
-                        sampled_tensordict = replay_buffer.sample()
+                (
+                    actor_losses,
+                    q_losses,
+                ) = ([], [])
+                for _ in range(num_updates):
+                    # Update actor every delayed_updates
+                    update_counter += 1
+                    update_actor = update_counter % delayed_updates == 0
 
+                    with timeit("rb - sample"):
+                        # Sample from replay buffer & the prior replay buffer
+                        # (50/50 according to RLPD)
+                        sampled_tensordict = replay_buffer.sample()
+                        del sampled_tensordict["param"]
+                        # del sampled_tensordict["loc"]
+                        sampled_tensordict_prior = prior_replay_buffer.sample()
+                        sampled_tensordict = torch.cat(
+                            (sampled_tensordict, sampled_tensordict_prior), dim=0
+                        )
                     with timeit("update"):
                         torch.compiler.cudagraph_mark_step_begin()
-                        loss_td = update(sampled_tensordict).clone()
-                    losses[i] = loss_td.select(
-                        "loss_actor", "loss_qvalue", "loss_alpha"
-                    )
+                        q_loss, actor_loss = update(sampled_tensordict, update_actor)
 
                     # Update priority
                     if prb:
-                        replay_buffer.update_priority(sampled_tensordict)
+                        with timeit("rb - priority"):
+                            replay_buffer.update_priority(sampled_tensordict)
+
+                    q_losses.append(q_loss.clone())
+                    if update_actor:
+                        actor_losses.append(actor_loss.clone())
+
         episode_end = (
             tensordict["next", "done"]
             if tensordict["next", "done"].any()
@@ -204,17 +266,15 @@ def main(cfg: DictConfig):  # noqa: F821
         metrics_to_log = {}
         if len(episode_rewards) > 0:
             episode_length = tensordict["next", "step_count"][episode_end]
-            metrics_to_log["train/reward"] = episode_rewards.sum() / len(episode_rewards)
+            metrics_to_log["train/reward"] = episode_rewards.mean()
             metrics_to_log["train/episode_length"] = episode_length.sum() / len(
                 episode_length
             )
+
         if collected_frames >= init_random_frames:
-            losses = losses.mean()
-            metrics_to_log["train/q_loss"] = losses.get("loss_qvalue")
-            metrics_to_log["train/actor_loss"] = losses.get("loss_actor")
-            metrics_to_log["train/alpha_loss"] = losses.get("loss_alpha")
-            metrics_to_log["train/alpha"] = loss_td["alpha"]
-            metrics_to_log["train/entropy"] = loss_td["entropy"]
+            metrics_to_log["train/q_loss"] = torch.stack(q_losses).mean()
+            if update_actor:
+                metrics_to_log["train/a_loss"] = torch.stack(actor_losses).mean()
 
         # Evaluation
         if abs(collected_frames % eval_iter) < frames_per_batch:
@@ -223,7 +283,7 @@ def main(cfg: DictConfig):  # noqa: F821
             ), torch.no_grad(), timeit("eval"):
                 eval_rollout = eval_env.rollout(
                     eval_rollout_steps,
-                    model[0],
+                    exploration_policy,
                     auto_cast_to_device=True,
                     break_when_any_done=True,
                 )
@@ -240,29 +300,6 @@ def main(cfg: DictConfig):  # noqa: F821
         eval_env.close()
     if not train_env.is_closed:
         train_env.close()
-
-
-    ## Transfer the trained policy to real robot
-    # A dummy safe module
-    td_module_hidden = SafeModule(
-        module = torch.nn.Identity(),
-        in_keys=["observation"],
-        out_keys=["observation"],
-    )
-     
-
-    # policy = ActorCriticOperator(td_module_hidden, model[0], model[1])
-    # robot = SPOT(cfg)
-    # with robot.lease_alive():
-    #     robot.power_on_stand()
-    #     # Create the RL environment from the robot
-    #     spot_env = make_spot_environment(robot)
-
-    #     # Inference on the trained policy
-    #     print("reset")
-    #     init_td = spot_env.reset(spot_env.gen_params())
-    #     print("rollout")
-    #     rollout = spot_env.rollout(100, policy, tensordict=init_td, auto_reset=False)
 
 
 if __name__ == "__main__":

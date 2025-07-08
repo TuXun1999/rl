@@ -20,7 +20,7 @@ from torchrl.envs import (
 
 from torchrl.envs.transforms.transforms import _apply_to_composite
 from torchrl.envs.utils import check_env_specs, step_mdp
-from robot import SpotRLEnvSE2
+
 DEFAULT_X = 2.0
 DEFAULT_ANGLE = np.pi
 
@@ -253,6 +253,36 @@ class SE2PointEnv(EnvBase):
     _step = _step
     _set_seed = _set_seed
 
+class SE2PointFixedStartEnv(SE2PointEnv):
+    def _reset(self, tensordict):
+        if tensordict is None or tensordict.is_empty() or tensordict.get("_reset") is not None:
+            # if no ``tensordict`` is passed, we generate a single set of hyperparameters
+            # Otherwise, we assume that the input ``tensordict`` contains all the relevant
+            # parameters to get started.
+            tensordict = self.gen_params(batch_size=self.batch_size)
+
+
+        high_x = torch.tensor(DEFAULT_X, device=self.device)
+        high_angle = torch.tensor(DEFAULT_ANGLE, device=self.device)
+        low_x = -high_x
+        low_angle = -high_angle
+        # for non batch-locked environments, the input ``tensordict`` shape dictates the number
+        # of simulators run simultaneously. In other contexts, the initial
+        # random state's shape will depend upon the environment batch-size instead.
+        x = torch.zeros(tensordict.shape, device=self.device) + 1    
+        y = torch.zeros(tensordict.shape, device=self.device) + 1
+        theta = torch.zeros(tensordict.shape, device=self.device) + np.pi
+
+        out = TensorDict(
+            {
+                "x": x,
+                "y": y,
+                "theta": theta,
+                "params": tensordict["params"],
+            },
+            batch_size=tensordict.shape,
+        )
+        return out
 # Helper functions for SE2 env
 class SinTransform(Transform):
     def _apply_transform(self, obs: torch.Tensor) -> None:
@@ -300,12 +330,13 @@ class CosTransform(Transform):
             dtype=observation_spec.dtype,
             device=observation_spec.device,
         )
-def create_se2_env(env_name = "se2", robot = None, transform_state_dict = None, device = "cpu"):
+def create_se2_env(type = "se2", device = "cpu"):
     # Create the RL environment
-    if env_name == "se2":
+    if type == "se2":
         env = SE2PointEnv(device=device)
-    elif env_name == "spot":
-        env = SpotRLEnvSE2(robot=robot, device=device)
+    elif type == "se2-fixed":
+        env = SE2PointFixedStartEnv(device=device)
+
     # The first unsqueeze is to help stack the input to the network
     env = TransformedEnv(
         env,
